@@ -1,0 +1,1097 @@
+---
+title: "Thymus DE Analysis"
+output: html_notebook
+---
+
+Zoë Steier
+
+* Analyze DE results over pseudotime.
+* Transcription factor enrichment analysis.
+
+# Load packages
+
+```{r Load packages}
+library(tidyverse)
+library(RColorBrewer)
+
+# For ChEA
+library(httr)
+library(jsonlite)
+library(readxl)
+library(openxlsx)
+
+library(pheatmap)
+library(scales)
+library(pals)
+
+packageVersion("httr")
+packageVersion("jsonlite")
+packageVersion("readxl")
+packageVersion("openxlsx")
+```
+
+# Load DE results and metadata
+
+```{r Load DE Results}
+DE_smallbins_lin <- read_csv("DE_results/DE_withinPseudotime_CD4_vs_CD8_smallbin.csv") %>%
+  select(Gene = "X1", everything())
+```
+
+```{r Load expression data}
+totalvi_path <- "/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/totalVI_thymus/thymus111_allbatches_stable_posselecting/totalVI_results/"
+totalVI_genes <- read_csv(gzfile(str_c(totalvi_path, "totalVI_genes.csv.gz"))) %>%
+  select(Gene = `0`) %>%
+  pull()
+
+# Load gene expression data
+denoised_genes <- read_csv(gzfile(str_c(totalvi_path, "denoised_genes.csv.gz")))
+totalVI_genes <- read_csv(gzfile(str_c(totalvi_path, "totalVI_genes.csv.gz")))
+obs <- read_csv(gzfile(str_c(totalvi_path, "obs.csv.gz")))
+
+meta_csv <- read_csv("/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/metadata/Metadata_SeqStats_totalSeq_experiments.csv")
+meta_thymus <- meta_csv %>%
+  filter(Tissue == "thymus") %>%
+  filter(TotalSeq_panel == "ADT111") # 19 batches in total
+meta_thymus <- meta_thymus %>%
+  mutate(Batch = seq(1, dim(meta_thymus)[1]) - 1) # rename batches starting at 0
+
+# Filtered data
+filt_path <- "/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/Annotation_thymus/"
+obs_filtered <- read_csv(gzfile(str_c(filt_path, "adata_positiveselection_filt_obs.csv.gz")))
+filtered_cells <- obs_filtered$X1
+
+denoised_genes <- denoised_genes %>%
+  select(-c(X1))
+colnames(denoised_genes) <- totalVI_genes[, 2][[1]]
+denoised_genes <- denoised_genes %>%
+  mutate(Barcode = obs$X1)
+
+pseudotime_data <- read_csv("/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/Slingshot_thymus/pseudotime_slingshot_2020913.csv", 
+                            col_types = cols(Lineage_by_genotype = col_character(), Lineage_by_genotypeSlingshot = col_character()))
+```
+
+# DE over pseudotime (timeline)
+## Make small time bins for DE testing
+
+```{r Load/save results with small bins}
+time_bins <- pseudotime_data %>%
+  mutate(Pseudotime_bin = cut(mean_pseudotime, breaks = seq(0,15, by = 1), include.lowest = TRUE,
+                              labels = str_c(as.character(seq(0, 14)))))
+# Assign cells > 16 to the last bin
+time_bins[is.na(time_bins$Pseudotime_bin), "Pseudotime_bin"] <- "14" # combine last two bins, since only ~100 CD8 cells fall in final bin
+
+as.data.frame.matrix(table(time_bins$Pseudotime_bin, time_bins$Genotype))
+table(time_bins$Pseudotime_bin, time_bins$Lineage_by_genotypeSlingshot)
+
+# Read in pseudotime data from all cells
+pseudotime_binned <- read_csv("/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/Slingshot_thymus/pseudotime_slingshot_binned_20200913.csv")
+
+time_bins_allcells <- pseudotime_binned %>% # keep cells in order from all cells
+  select(Barcode, Lineage_by_genotypeSlingshot) %>%
+  left_join(time_bins %>% select(-c("Lineage_by_genotypeSlingshot")), by = "Barcode") %>%
+  select(Barcode, mean_pseudotime, Pseudotime_bin, Lineage_by_genotypeSlingshot, everything())
+
+write_csv(time_bins_allcells, "/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/Slingshot_thymus/pseudotime_slingshot_binned_20210202.csv")
+```
+
+## DE over pseudotime with bin ranges
+
+```{r Timeline data to plot}
+DE_timeline <- DE_smallbins_lin %>%
+  filter(non_zeros_proportion1 > 0.05 | non_zeros_proportion2 > 0.05) %>% # must be expressed at least in one group
+  filter(!(str_detect(Gene, "ADT_"))) %>%
+  filter(Gene %in% c("Gata3", "Runx3", "Zbtb7b", "Cd69", "Egr1", "Cd4", "Cd8a", "CD5", "Cd5")) %>%
+  mutate(Significant = case_when(
+      bayes_factor > 2 &
+      (((non_zeros_proportion1 > 0.05) & (lfc_median > .2)) | ((non_zeros_proportion2 > 0.05) & (lfc_median < -.2))) ~ "Significant",
+      TRUE ~ "Not significant" 
+    )) %>%
+  select(Gene, clusters, lfc_median, bayes_factor, Significant, non_zeros_proportion1, non_zeros_proportion2, lfc_std)
+
+DE_timeline_proteins <- DE_smallbins_lin %>%
+  filter((str_detect(Gene, "ADT_"))) %>%
+  filter(Gene %in% c("ADT_CD4_A0001", "ADT_CD8a_A0002", "ADT_CD5_A0111")) %>%
+  mutate(Significant = case_when(
+      bayes_factor > 1 &
+      (((lfc_median > .2)) | ((lfc_median < -.2))) ~ "Significant",
+      TRUE ~ "Not significant" 
+    )) %>%
+  mutate(Gene = recode(Gene, ADT_CD4_A0001 = "CD4", ADT_CD8a_A0002 = "CD8a", ADT_CD5_A0111 = "CD5")) %>%
+  select(Gene, clusters, lfc_median, bayes_factor, Significant, lfc_std) 
+
+DE_timeline_all <- rbind(DE_timeline %>% select(-c(non_zeros_proportion1, non_zeros_proportion2)), DE_timeline_proteins) %>%
+  select(Feature = Gene, everything())
+```
+
+```{r Add bin ranges to data}
+DE_timeline_all <- DE_timeline_all %>%
+  mutate(Bin_ranges = factor(recode(clusters, `0` = "0-1",
+                             `1` = "1-2",
+                             `2` = "2-3",
+                             `3` = "3-4",
+                             `4` = "4-5",
+                             `5` = "5-6",
+                             `6` = "6-7",
+                             `7` = "7-8",
+                             `8` = "8-9",
+                             `9` = "9-10",
+                             `10` = "10-11",
+                             `11` = "11-12",
+                             `12` = "12-13",
+                             `13` = "13-14",
+                             `14` = "14-16"), levels = c("0-1", "1-2","2-3","3-4","4-5","5-6","6-7","7-8","8-9","9-10","10-11","11-12","12-13","13-14","14-16")))
+
+bin_ranges_labels <- c(`0` = "0-1",
+                             `1` = "1-2",
+                             `2` = "2-3",
+                             `3` = "3-4",
+                             `4` = "4-5",
+                             `5` = "5-6",
+                             `6` = "6-7",
+                             `7` = "7-8",
+                             `8` = "8-9",
+                             `9` = "9-10",
+                             `10` = "10-11",
+                             `11` = "11-12",
+                             `12` = "12-13",
+                             `13` = "13-14",
+                             `14` = "14-16")
+```
+
+```{r Plot DE over pseudotime timeline with bin ranges}
+# Plot coreceptors
+ggplot() +
+  geom_errorbar(data = DE_timeline_all %>% filter(Feature %in% c("Cd4", "CD4", "Cd8a", "CD8a")),
+          aes(x = clusters, y = lfc_median, ymin = lfc_median - lfc_std, ymax = lfc_median + lfc_std, width = .2), color = "gray", alpha = .4, size = .2) +
+  geom_errorbar(data = DE_timeline_all %>% filter(Feature %in% c("Cd4", "CD4", "Cd8a", "CD8a"), Significant == "Significant"),
+          aes(x = clusters, y = lfc_median, ymin = lfc_median - lfc_std, ymax = lfc_median + lfc_std, color = Feature, linetype = Feature, width = .2), size = .2) +
+  geom_line(data = DE_timeline_all %>% filter(Feature %in% c("Cd4", "CD4", "Cd8a", "CD8a")), 
+            aes(x = clusters, y = lfc_median, color = Feature, linetype = Feature), size = .2) +
+  geom_point(data = DE_timeline_all %>% filter(Feature %in% c("Cd4", "CD4", "Cd8a", "CD8a")),
+             aes(x = clusters, y = lfc_median, size = bayes_factor), color = "gray", alpha = 0.4) +
+  scale_size_area(limits = c(0.2,5), max_size = 4) +
+  geom_point(data = DE_timeline_all %>% filter(Significant == "Significant", Feature %in% c("Cd4", "CD4", "Cd8a", "CD8a")),
+             aes(x = clusters, y = lfc_median, color = Feature, size = bayes_factor, shape = Feature)) +
+  scale_shape_manual(values = c("Cd4" = 16, "CD4" = 21, "Cd8a" = 16, "CD8a" = 1, "Gata3" = 16, "Runx3" = 16, "Zbtb7b" = 16, "Cd69" = 16, "Egr1" = 16)) +
+  scale_color_manual(values = c("Cd4" = "#F8766D", "CD4" = "#F8766D", "Cd8a" = "#00B6EB", "CD8a" = "#00B6EB", "Gata3" = "#A58AFF", "Runx3" = "#00C094", "Zbtb7b" = "#FB61D7", "Cd69" = "#C49A00", "Egr1" = "#53B400"),
+                     breaks = c("Cd4", "CD4", "Cd8a", "CD8a", "Gata3", "Runx3", "Zbtb7b", "Cd69", "Egr1")) +
+  scale_linetype_manual(values = c("Cd4" = "longdash", "CD4" = "solid", "Cd8a" = "longdash", "CD8a" = "solid", "Gata3" = "longdash", "Runx3" = "longdash", "Zbtb7b" = "longdash", "Cd69" = "longdash", "Egr1" = "longdash"),
+                     breaks = c("Cd4", "CD4", "Cd8a", "CD8a", "Gata3", "Runx3", "Zbtb7b", "Cd69", "Egr1")) +
+  theme_classic() +
+  scale_x_continuous(breaks = seq(0, 14, 1), minor_breaks = NULL, labels = bin_ranges_labels) +
+  theme(axis.text.x = element_text(angle = 45, vjust = .5)) +
+  geom_hline(yintercept = 0) +
+  labs(x = "Pseudotime", y = "Log fold change", size = "Bayes factor", color = "Feature", linetype = "Feature", shape = "Feature") 
+ggsave("figures/DEtiming_coreceptors.pdf", bg = "transparent", height = 3.5, width = 5)
+
+# Plot master regulator TFs
+ggplot() +
+  geom_errorbar(data = DE_timeline_all %>% filter(Feature %in% c("Gata3", "Runx3", "Zbtb7b")),
+          aes(x = clusters, y = lfc_median, ymin = lfc_median - lfc_std, ymax = lfc_median + lfc_std, width = .2), color = "gray", alpha = .4, size = .2) +
+  geom_errorbar(data = DE_timeline_all %>% filter(Feature %in% c("Gata3", "Runx3", "Zbtb7b"), Significant == "Significant"),
+          aes(x = clusters, y = lfc_median, ymin = lfc_median - lfc_std, ymax = lfc_median + lfc_std, color = Feature, linetype = Feature, width = .2), size = .2) +
+  geom_line(data = DE_timeline_all %>% filter(Feature %in% c("Gata3", "Runx3", "Zbtb7b")), 
+          aes(x = clusters, y = lfc_median, color = Feature, linetype = Feature, group = Feature), size = .2, alpha = 1) +
+  geom_point(data = DE_timeline_all %>% filter(Feature %in% c("Gata3", "Runx3", "Zbtb7b")),
+             aes(x = clusters, y = lfc_median, size = bayes_factor), color = "gray", alpha = 0.4) +
+  geom_point(data = DE_timeline_all %>% filter(Significant == "Significant", Feature %in% c("Gata3", "Runx3", "Zbtb7b")),
+             aes(x = clusters, y = lfc_median, color = Feature, size = bayes_factor, shape = Feature), alpha = 1) +
+  geom_point(data = DE_timeline_all %>% filter(Significant == "Significant", Feature %in% c("Zbtb7b")), # Make Zbtb7b visible
+             aes(x = clusters, y = lfc_median, color = Feature, size = bayes_factor, shape = Feature), alpha = 1) +
+  scale_size_area(limits = c(0.2,5), max_size = 4) +
+  scale_shape_manual(values = c("Cd4" = 16, "CD4" = 1, "Cd8a" = 16, "CD8a" = 1, "Gata3" = 16, "Runx3" = 16, "Zbtb7b" = 16, "Cd69" = 16, "Egr1" = 16)) +
+  scale_color_manual(values = c("Cd4" = "#F8766D", "CD4" = "#F8766D", "Cd8a" = "#00B6EB", "CD8a" = "#00B6EB", "Gata3" = "#A58AFF", "Runx3" = "#00C094", "Zbtb7b" = "#FB61D7", "Cd69" = "#C49A00", "Egr1" = "#53B400"),
+                     breaks = c("Cd4", "CD4", "Cd8a", "CD8a", "Gata3", "Runx3", "Zbtb7b", "Cd69", "Egr1")) +
+  scale_linetype_manual(values = c("Cd4" = "longdash", "CD4" = "solid", "Cd8a" = "longdash", "CD8a" = "solid", "Gata3" = "longdash", "Runx3" = "longdash", "Zbtb7b" = "longdash", "Cd69" = "longdash", "Egr1" = "longdash"),
+                        breaks = c("Cd4", "CD4", "Cd8a", "CD8a", "Gata3", "Runx3", "Zbtb7b", "Cd69", "Egr1")) +
+  theme_classic() +
+  scale_x_continuous(breaks = seq(0, 14, 1), minor_breaks = NULL, labels = bin_ranges_labels) +
+  theme(axis.text.x = element_text(angle = 45, vjust = .5)) +
+  geom_hline(yintercept = 0) +
+  labs(x = "Pseudotime", y = "Log fold change", size = "Bayes factor", color = "Feature", linetype = "Feature", shape = "Feature")
+ggsave("figures/DEtiming_masterregs.pdf", bg = "transparent", height = 3.5, width = 5)
+
+# Plot TCR response genes
+ggplot() +
+  geom_errorbar(data = DE_timeline_all %>% filter(Feature %in% c("Cd69", "Egr1")),
+        aes(x = clusters, y = lfc_median, ymin = lfc_median - lfc_std, ymax = lfc_median + lfc_std, width = .2), color = "gray", alpha = .4, size = .2) +
+  geom_errorbar(data = DE_timeline_all %>% filter(Feature %in% c("Cd69", "Egr1"), Significant == "Significant"),
+        aes(x = clusters, y = lfc_median, ymin = lfc_median - lfc_std, ymax = lfc_median + lfc_std, color = Feature, linetype = Feature, width = .2), size = .2) +
+  geom_line(data = DE_timeline_all %>% filter(Feature %in% c("Cd69", "Egr1")), 
+        aes(x = clusters, y = lfc_median, color = Feature, linetype = Feature), size = .2, alpha = 1) +
+  geom_point(data = DE_timeline_all %>% filter(Feature %in% c("Cd69", "Egr1")),
+        aes(x = clusters, y = lfc_median, size = bayes_factor), color = "gray", alpha = 0.4) +
+  geom_point(data = DE_timeline_all %>% filter(Significant == "Significant", Feature %in% c("Cd69", "Egr1")),
+             aes(x = clusters, y = lfc_median, color = Feature, shape = Feature, size = bayes_factor), alpha = 1) +
+  scale_size_area(limits = c(0.2,5), max_size = 4) +
+  scale_shape_manual(values = c("Cd4" = 16, "CD4" = 1, "Cd8a" = 16, "CD8a" = 1, "Gata3" = 16, "Runx3" = 16, "Zbtb7b" = 16, "Cd69" = 16, "Egr1" = 16),
+                     breaks = c("Cd4", "CD4", "Cd8a", "CD8a", "Gata3", "Runx3", "Zbtb7b", "Cd69", "Egr1")) +
+  scale_color_manual(values = c("Cd4" = "#F8766D", "CD4" = "#F8766D", "Cd8a" = "#00B6EB", "CD8a" = "#00B6EB", "Gata3" = "#A58AFF", "Runx3" = "#00C094", "Zbtb7b" = "#FB61D7", "Cd69" = "#C49A00", "Egr1" = "#53B400"),
+                     breaks = c("Cd4", "CD4", "Cd8a", "CD8a", "Gata3", "Runx3", "Zbtb7b", "Cd69", "Egr1")) +
+  scale_linetype_manual(values = c("Cd4" = "longdash", "CD4" = "solid", "Cd8a" = "longdash", "CD8a" = "solid", "Gata3" = "longdash", "Runx3" = "longdash", "Zbtb7b" = "longdash", "Cd69" = "longdash", "Egr1" = "longdash"),
+                        breaks = c("Cd4", "CD4", "Cd8a", "CD8a", "Gata3", "Runx3", "Zbtb7b", "Cd69", "Egr1")) +
+  theme_classic() +
+  scale_x_continuous(breaks = seq(0, 14, 1), minor_breaks = NULL, labels = bin_ranges_labels) +
+  theme(axis.text.x = element_text(angle = 45, vjust = .5)) +
+  geom_hline(yintercept = 0) +
+  labs(x = "Pseudotime", y = "Log fold change", color = "Feature", linetype = "Feature", shape = "Feature", size = "Bayes factor") +
+  guides(color = guide_legend(order = 1), linetype = guide_legend(order = 1), shape = guide_legend(order = 1), size = guide_legend(order = 2)) # changes order of multiple guides to match
+ggsave("figures/DEtiming_tcrresponse.pdf", bg = "transparent", height = 3.5, width = 5)
+```
+
+## Number of DE genes over time for small bins
+
+```{r Between lineage DE small bins}
+# See how the number of DE genes and proteins increases over pseudotime
+DE_betweenlineage <- DE_smallbins_lin
+
+# RNA (DE in either direction)
+DE_RNA_betweenLineage <- c()
+DErna4 <- c()
+DErna8 <- c()
+for (cluster in unique(DE_betweenlineage$clusters)) {
+  DE_bylin <- DE_betweenlineage %>%
+    filter(bayes_factor > 2) %>% 
+    filter( ((non_zeros_proportion1 > 0.05) & (lfc_median > .2)) | ((non_zeros_proportion2 > 0.05) & (lfc_median < -.2))) %>%
+    filter(!(str_detect(Gene, "ADT_"))) %>%
+    filter(clusters == cluster)
+  number_DE <- dim(DE_bylin)[1]
+  number_4 <- dim(DE_bylin %>% filter(lfc_median > 0.2))[1]
+  number_8 <- dim(DE_bylin %>% filter(lfc_median < -0.2))[1]
+  
+  DE_RNA_betweenLineage <- c(DE_RNA_betweenLineage, number_DE)
+  DErna4 <- c(DErna4, number_4)
+  DErna8 <- c(DErna8, number_8)
+}
+
+# Proteins
+DE_protein_betweenLineage <- c()
+DEprot4 <- c()
+DEprot8 <- c()
+for (cluster in unique(DE_betweenlineage$clusters)) {
+  DE_bylin <- DE_betweenlineage %>%
+    filter(bayes_factor > 1) %>% 
+    filter(clusters == cluster) %>%
+    filter((str_detect(Gene, "ADT_"))) %>%
+    filter(abs(lfc_median) > 0.2)
+  number_DE <- dim(DE_bylin)[1]
+  number_4 <- dim(DE_bylin %>% filter(lfc_median > 0.2))[1]
+  number_8 <- dim(DE_bylin %>% filter(lfc_median < -0.2))[1]
+  
+  DE_protein_betweenLineage <- c(DE_protein_betweenLineage, number_DE)
+  DEprot4 <- c(DEprot4, number_4)
+  DEprot8 <- c(DEprot8, number_8)
+}
+
+# Collect results
+DEnum_byTime_rna <- tibble(time = unique(DE_betweenlineage$clusters), RNA = DE_RNA_betweenLineage, CD4 = DErna4, CD8 = DErna8) %>%
+  pivot_longer(cols = "RNA", names_to = "Feature", values_to = "Number_DE") 
+DEnum_byTime_prot <- tibble(time = unique(DE_betweenlineage$clusters), Protein = DE_protein_betweenLineage, CD4 = DEprot4, CD8 = DEprot8) %>%
+    pivot_longer(cols = "Protein", names_to = "Feature", values_to = "Number_DE")
+DE_byTime <- rbind(DEnum_byTime_rna, DEnum_byTime_prot) 
+DE_byTime$Feature <- factor(DE_byTime$Feature, levels = c("RNA", "Protein"))
+DE_byTime$time <- factor(DE_byTime$time)
+  
+new_theme <- theme(
+              panel.background = element_blank(),panel.grid.major = element_blank(), panel.grid.minor = element_blank(),axis.line = element_line(colour = "black"),
+              strip.background = element_blank(),
+              axis.text.x=element_text(angle = 45, vjust = .5)
+        )
+
+# Total number DE
+ggplot(DE_byTime, aes(fill = time, y = Number_DE, x = time)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = colorRampPalette(brewer.pal(11,'Spectral')[-6])(15), labels = bin_ranges_labels) +
+  facet_wrap(~Feature, nrow = 1, scales = "free_y") +
+  scale_x_discrete(labels = bin_ranges_labels) +
+  new_theme +
+  labs(x = "Pseudotime", y = "Differentially expressed features", fill = "Pseudotime")
+ggsave("figures/DE_number_over_time.pdf", bg = "transparent", height = 4.5, width = 6) # height 4
+```
+
+# ChEA3 small bins DE between lineages
+## CD4 TF enrichment
+
+```{r Set up DE data for TF enrichment}
+DE_betweenlineage <- DE_smallbins_lin
+
+expressed_genes <- unique(c((DE_betweenlineage %>% filter(!(str_detect(Gene, "ADT_"))))$Gene))
+length(expressed_genes) # 5108 (totalVI gene set)
+```
+
+```{r Run ChEA3 for CD4s}
+# Find DE gene list
+gene_lists = list()
+for (cluster in unique(DE_betweenlineage$clusters)) {
+  name <- str_c("CD4_bin", as.character(cluster))
+  de_list <- (DE_betweenlineage %>% 
+                              filter(bayes_factor > 2.0) %>% 
+                              filter(clusters == cluster) %>% 
+                              filter(non_zeros_proportion1 > 0.05) %>% 
+                              filter(lfc_median > 0.2) %>% 
+                              filter(!str_detect(Gene, "ADT_")))$Gene
+  gene_lists[[name]] <- de_list
+}
+
+# Query ChEA database
+url = "https://amp.pharm.mssm.edu/chea3/api/enrich/"
+encode = "json"
+
+ChEA_results <- list()
+for (list_num in seq(1, length(gene_lists))) {
+  query <- names(gene_lists)[list_num]
+  gene_set <- (gene_lists[[list_num]]) # must be a character, not list
+  
+  if (length(gene_set) > 1) { # gene list must contain more than 1 gene
+  
+    payload = list(query_name = query, gene_set = gene_set)
+    
+    #POST to ChEA3 server
+    response = POST(url = url, body = payload, encode = encode)
+    json = content(response, "text")
+    
+    # Results as list of R dataframes
+    results = fromJSON(json)
+    results <- as_tibble(results[["Integrated--meanRank"]]) %>%
+      mutate(TF = (str_to_title(TF))) %>%
+      filter(TF %in% expressed_genes)         # filter results by whether the gene is expressed in this data
+    
+    ChEA_results[[query]] <- results
+  }
+}
+
+cd4_de_list_lengths <- lengths(gene_lists)
+```
+
+```{r Save CD4 ChEA3 results}
+write.xlsx(ChEA_results, file = "/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/DE_thymus/ChEA3_results/CD4_TFenrichment_smallbins.xlsx")
+
+CD4_genes <- tibble(Time_bin = names(gene_lists))
+CD4_genes$DE_genes <- ""
+for (i in seq(length(gene_lists))) {
+  CD4_genes[i, "DE_genes"] <- str_c(unlist(gene_lists[i]), collapse = ", ")
+}
+write_csv(CD4_genes, "/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/DE_thymus/ChEA3_results/CD4_DE_genes_smallbins.csv")
+```
+
+## CD8 TF enrichment
+
+```{r Run ChEA3 for CD8s}
+# Find DE gene list
+gene_lists = list()
+for (cluster in unique(DE_betweenlineage$clusters)) {
+  name <- str_c("CD8_bin", as.character(cluster))
+  de_list <- (DE_betweenlineage %>% 
+                              filter(bayes_factor > 2.0) %>% 
+                              filter(clusters == cluster) %>% 
+                              filter(non_zeros_proportion2 > 0.05) %>% 
+                              filter(lfc_median < -0.2) %>% 
+                              filter(!str_detect(Gene, "ADT_")))$Gene
+  gene_lists[[name]] <- de_list
+}
+
+# Query ChEA database
+url = "https://amp.pharm.mssm.edu/chea3/api/enrich/"
+encode = "json"
+
+ChEA_results <- list()
+for (list_num in seq(1, length(gene_lists))) {
+  query <- names(gene_lists)[list_num]
+  gene_set <- (gene_lists[[list_num]]) # must be a character, not list
+  if (length(gene_set) > 1) { 
+    payload = list(query_name = query, gene_set = gene_set)
+    
+    #POST to ChEA3 server
+    response = POST(url = url, body = payload, encode = encode)
+    json = content(response, "text")
+    
+    # Results as list of R dataframes
+    results = fromJSON(json)
+    results <- as_tibble(results[["Integrated--meanRank"]]) %>%
+      mutate(TF = (str_to_title(TF))) %>%
+      filter(TF %in% expressed_genes)         # filter results by whether the gene is expressed in this data
+    
+    ChEA_results[[query]] <- results
+  }
+}
+
+cd8_de_list_lengths <- lengths(gene_lists)
+```
+```{r Save CD8 ChEA3 results}
+write.xlsx(ChEA_results, file = "/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/DE_thymus/ChEA3_results/CD8_TFenrichment_smallbins.xlsx")
+
+CD8_genes <- tibble(Time_bin = names(gene_lists))
+CD8_genes$DE_genes <- ""
+for (i in seq(length(gene_lists))) {
+  CD8_genes[i, "DE_genes"] <- str_c(unlist(gene_lists[i]), collapse = ", ")
+}
+write_csv(CD8_genes, "/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/DE_thymus/ChEA3_results/CD8_DE_genes_smallbins.csv")
+```
+
+# ChEA3 on small bin clustered genes
+## Plot clustered genes
+
+```{r Load gene clusters}
+cd4_gene_clusters <- read_csv("DE_results/clusteredDE_CD4_genes_smallbins.csv")
+cd8_gene_clusters <- read_csv("DE_results/clusteredDE_CD8_genes_smallbins.csv")
+temporal_gene_clusters <- read_csv("DE_results/clusteredDE_temporal_genes_smallbins.csv")
+
+cd4_gene_clusters$Cluster <- as.factor(cd4_gene_clusters$Cluster)
+cd8_gene_clusters$Cluster <- as.factor(cd8_gene_clusters$Cluster)
+temporal_gene_clusters$Cluster <- as.factor(temporal_gene_clusters$Cluster)
+```
+
+```{r Merge genes and meta}
+# Scaling to 98th percentile so the scale isn't biased by high outliers
+scale_98 <- function(x, na.rm = TRUE) {rescale(x, to = c(0,1), from = c(min(x), quantile(x, .98)))}
+
+# Add metadata and scale
+denoised_genes_annotated <- denoised_genes %>%
+  left_join(pseudotime_data %>% select(Barcode, mean_pseudotime, Lineage_by_genotypeSlingshot, Genotype), by = "Barcode") %>%
+  filter(Lineage_by_genotypeSlingshot %in% c("CD4", "CD8")) %>%
+  select(all_of(totalVI_genes[, 2][[1]]), Lineage_by_genotypeSlingshot, mean_pseudotime, Genotype) %>%
+  mutate_at(totalVI_genes[, 2][[1]], scale_98) %>%
+  pivot_longer(cols = all_of(totalVI_genes[, 2][[1]]), names_to = "Gene")
+```
+
+```{r Plot CD4 clustered DE genes}
+redcol <- brewer.pal(3, "Set1")[1]
+bluecol <- brewer.pal(3, "Set1")[2]
+
+# Select DE genes
+CD4_genes_annotated <- denoised_genes_annotated %>%
+  filter(Gene %in% cd4_gene_clusters$Gene) %>%
+  left_join(cd4_gene_clusters, by = "Gene") %>%
+  group_by(Cluster, mean_pseudotime, Lineage_by_genotypeSlingshot) %>% # group by cluster, time, lineage and take mean
+  summarize(cluster_mean = mean(value))
+
+# Plot by loess, facet by cluster
+ggplot(CD4_genes_annotated, aes(x = mean_pseudotime, y = cluster_mean, color = Lineage_by_genotypeSlingshot)) +
+  geom_smooth(method = "loess", span = .5, se = FALSE) +
+  scale_color_manual(values = c(redcol, bluecol)) +
+  facet_wrap("Cluster", ncol = 5) +
+  labs(x = "Pseudotime", y = "Mean scaled\n denoised expression", color = "Lineage", title = "MHCII-specific gene clusters") +
+  theme_classic()
+ggsave("figures/DEgeneclusters_CD4.pdf", bg = "transparent", height = 2.5, width = 7.5)
+```
+
+```{r Plot CD8 clustered DE genes}
+# Select DE genes
+CD8_genes_annotated <- denoised_genes_annotated %>%
+  filter(Gene %in% cd8_gene_clusters$Gene) %>%
+  left_join(cd8_gene_clusters, by = "Gene") %>%
+  group_by(Cluster, mean_pseudotime, Lineage_by_genotypeSlingshot) %>% # group by cluster, time, lineage and take mean
+  summarize(cluster_mean = mean(value))
+
+# Plot by loess, facet by cluster
+ggplot(CD8_genes_annotated, aes(x = mean_pseudotime, y = cluster_mean, color = Lineage_by_genotypeSlingshot)) +
+  geom_smooth(method = "loess", span = .5, se = FALSE) +
+  scale_color_manual(values = c(redcol, bluecol)) +
+  facet_wrap("Cluster", ncol = 5) +
+  labs(x = "Pseudotime", y = "Mean scaled\n denoised expression", color = "Lineage", title = "MHCI-specific gene clusters") +
+  theme_classic()
+ggsave("figures/DEgeneclusters_CD8.pdf", bg = "transparent", height = 2.5, width = 7.5)
+```
+
+## TF enrichment on gene clusters
+
+```{r TF enrichment on CD4 clusters}
+# Find DE gene list
+gene_lists = list()
+for (cluster in levels(cd4_gene_clusters$Cluster)) {
+  name <- str_c("CD4_cluster", as.character(cluster))
+  de_list <- cd4_gene_clusters %>%
+    filter(Cluster == cluster) %>%
+    select(Gene) %>%
+    pull()
+  gene_lists[[name]] <- de_list
+}
+
+# Query ChEA database
+url = "https://amp.pharm.mssm.edu/chea3/api/enrich/"
+encode = "json"
+
+ChEA_results <- list()
+for (list_num in seq(1, length(gene_lists))) {
+  query <- names(gene_lists)[list_num]
+  gene_set <- (gene_lists[[list_num]]) # must be a character, not list
+  
+  if (length(gene_set) > 1) { # gene list must contain more than 1 gene
+  
+    payload = list(query_name = query, gene_set = gene_set)
+    
+    #POST to ChEA3 server
+    response = POST(url = url, body = payload, encode = encode)
+    json = content(response, "text")
+    
+    # Results as list of R dataframes
+    results = fromJSON(json)
+    results <- as_tibble(results[["Integrated--meanRank"]]) %>%
+      mutate(TF = (str_to_title(TF))) %>%
+      filter(TF %in% expressed_genes)    # filter results by whether the gene is expressed in this data
+
+    ChEA_results[[query]] <- results
+  }
+}
+```
+
+```{r Save CD4 results by cluster}
+write.xlsx(ChEA_results, file = "/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/DE_thymus/ChEA3_results/CD4_TFenrichment_clusters.xlsx")
+
+ChEA_results
+
+# Cluster 4: Nfatc2 is top ranked, Tcf7 and Lef1 also in top 10
+# Cluster 7 is Egr
+```
+
+```{r TF enrichment on CD8 clusters}
+# Find DE gene list
+gene_lists = list()
+for (cluster in levels(cd8_gene_clusters$Cluster)) {
+  name <- str_c("CD8_cluster", as.character(cluster))
+  de_list <- cd8_gene_clusters %>%
+    filter(Cluster == cluster) %>%
+    select(Gene) %>%
+    pull()
+  gene_lists[[name]] <- de_list
+}
+
+# Query ChEA database
+url = "https://amp.pharm.mssm.edu/chea3/api/enrich/"
+encode = "json"
+
+ChEA_results <- list()
+for (list_num in seq(1, length(gene_lists))) {
+  query <- names(gene_lists)[list_num]
+  gene_set <- (gene_lists[[list_num]]) # must be a character, not list
+  
+  if (length(gene_set) > 1) { # gene list must contain more than 1 gene
+  
+    payload = list(query_name = query, gene_set = gene_set)
+    
+    #POST to ChEA3 server
+    response = POST(url = url, body = payload, encode = encode)
+    json = content(response, "text")
+    
+    #results as list of R dataframes
+    results = fromJSON(json)
+    results <- as_tibble(results[["Integrated--meanRank"]]) %>%
+      mutate(TF = (str_to_title(TF))) %>%
+      filter(TF %in% expressed_genes)   # filter results by whether the gene is expressed in this data
+    
+    ChEA_results[[query]] <- results
+  }
+}
+```
+
+```{r Save CD8 results by cluster}
+write.xlsx(ChEA_results, file = "/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/DE_thymus/ChEA3_results/CD8_TFenrichment_clusters.xlsx")
+
+ChEA_results
+```
+
+# Megatable
+## Create TCR signaling gene sets
+
+```{r Find TCR pathway genes from Netpath}
+TCR_pathway <- read_csv("/data/yosef2/users/zsteier/references/Signatures/NetPath_TCR.csv", col_names = FALSE) %>%
+  pivot_longer(cols = everything(), values_to = "Gene") %>%
+  select(Gene) %>%
+  mutate(Gene = str_to_title(Gene)) %>%
+  drop_na() %>%
+  pull()
+```
+
+```{r Find genes upregulated by TCR pathway from Netpath}
+TCRreg <- read_csv("/data/yosef2/users/zsteier/TotalSeq/20190718_NovaSeq_ZRS07/ZRS07_ZRS06_analysis/GSEA/NetPath_TCR_regulated.csv")
+TCRreg <- TCRreg[17:648, c(2, 3, 7, 8)]
+colnames(TCRreg) <- TCRreg[1,]
+TCRreg <- TCRreg %>%
+  mutate("Gene" = str_to_title(`Gene Symbol`))
+TCRregup <- TCRreg[2:450,]$Gene
+```
+
+```{r Find DP activated genes}
+# See Mingeneau et al., 2012
+DPactivated <- read_csv("/data/yosef2/users/zsteier/references/Signatures/Mingeneau_DPactivated.csv") %>%
+  pull()
+
+# TCR signature including all sets
+TCR_sig <- unique(c(TCR_pathway, TCRregup, DPactivated))
+```
+
+```{r Create TCR signaling gene set}
+TCR_set <- unique(c(TCR_pathway, TCRregup))
+TCR_manual <- c("Egr2", "Runx1", "Ets1", "Nfkb2", "Foxo1", "Irf4", "Elk3", "Junb", "Jund", "Tcf7") # manual list of TCR genes
+TCR_set <- c(TCR_set, TCR_manual)
+```
+
+```{r Find TFs that target master regulators}
+# Read Chea results
+cd4_chea_filepath <- "/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/DE_thymus/ChEA3_results/CD4_TFenrichment_smallbins.xlsx"
+cd8_chea_filepath <- "/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/DE_thymus/ChEA3_results/CD8_TFenrichment_smallbins.xlsx"
+
+tab_names <- excel_sheets(cd4_chea_filepath)
+Chea_CD4 <- reduce(lapply(tab_names, function(x) read_excel(path = cd4_chea_filepath, sheet = x)), rbind)
+Targets_masterreg4 <- Chea_CD4 %>%
+  mutate(Targets_masterreg = str_detect(Overlapping_Genes, "RUNX3|ZBTB7B|GATA3")) %>%
+  filter(Targets_masterreg == TRUE) %>%
+  select(TF) %>%
+  pull() %>%
+  unique()
+tab_names <- excel_sheets(cd8_chea_filepath)
+Chea_CD8 <- reduce(lapply(tab_names, function(x) read_excel(path = cd8_chea_filepath, sheet = x)), rbind)
+Targets_masterreg8 <- Chea_CD8 %>%
+  mutate(Targets_masterreg = str_detect(Overlapping_Genes, "RUNX3")) %>%
+  filter(Targets_masterreg == TRUE) %>%
+  select(TF) %>%
+  pull() %>%
+  unique()
+
+# Search overlapping gene list for master regulators, then filter for any TFs that target these
+Targets_masterreg <- unique(c(Targets_masterreg4, Targets_masterreg8))
+```
+
+## Collect DE results
+
+```{r CD4 select DE bins}
+DE_CD4_table_viewing <- DE_smallbins_lin %>%
+  filter(clusters %in% c(4, 5, 6, 7)) %>%
+  filter(bayes_factor > 2) %>% 
+  filter(non_zeros_proportion1 > 0.05, lfc_median > .2) %>% 
+  filter(!(str_detect(Gene, "ADT_"))) %>%
+  select(Gene, bayes_factor, non_zeros_proportion1, non_zeros_proportion2, lfc_median, clusters) %>%
+  mutate(LFC = lfc_median)
+
+DE_CD4_table <- DE_smallbins_lin %>%
+  filter(clusters %in% c(4, 5, 6, 7)) %>%
+  filter(bayes_factor > 2) %>%
+  filter(non_zeros_proportion1 > 0.05, lfc_median > .2) %>%
+  filter(!(str_detect(Gene, "ADT_"))) %>%
+  mutate(LFC = lfc_median) %>%
+  select(Gene, LFC, clusters)
+```
+
+```{r CD8 select DE bins}
+# CD8 DE for megatable: bins 5-8
+DE_CD8_table_view <- DE_smallbins_lin %>%
+  filter(clusters %in% c(5, 6, 7, 8)) %>% # 5 is first DE > 15 genes
+  filter(bayes_factor > 2) %>%
+  filter(non_zeros_proportion2 > 0.05, lfc_median < -.2) %>%
+  filter(!(str_detect(Gene, "ADT_"))) %>%
+  select(Gene, bayes_factor, non_zeros_proportion1, non_zeros_proportion2, lfc_median, clusters) %>%
+  mutate(LFC = -1*lfc_median)
+
+DE_CD8_table <- DE_smallbins_lin %>%
+  filter(clusters %in% c(5, 6, 7, 8)) %>%
+  filter(bayes_factor > 2) %>% 
+  filter(non_zeros_proportion2 > 0.05, lfc_median < -.2) %>% 
+  filter(!(str_detect(Gene, "ADT_"))) %>%
+  mutate(LFC = -1*lfc_median) %>%
+  select(Gene, LFC, clusters)
+```
+
+## Collect ChEA results
+
+```{r Collect results for CD4}
+TF_CD4_table <- Chea_CD4 %>%
+  filter(`Query Name` %in% c("CD4_bin4", "CD4_bin5", "CD4_bin6", "CD4_bin7")) %>%
+  select(Gene = TF, everything()) %>%
+  mutate(Score = as.numeric(Score)) %>% # necessary for ranking to work
+  mutate(Pseudotime_bin = as.integer(str_replace(`Query Name`, "CD4_bin", ""))) %>%
+  left_join(DE_smallbins_lin %>% select(Gene, non_zeros_proportion1, clusters) %>% filter(clusters %in% c(4, 5, 6, 7)), by = c("Gene", "Pseudotime_bin" = "clusters")) %>%
+  filter(non_zeros_proportion1 > 0.05) %>%
+  select(-c("non_zeros_proportion1")) %>%
+  select(-c(`Query Name`, Library, Rank, Overlapping_Genes)) %>%
+  group_by(Pseudotime_bin) %>%
+  mutate(Rank_bin = rank(Score)) %>%
+  pivot_wider(id_cols = c("Gene"), names_from = Pseudotime_bin, values_from = c(Score, Rank_bin)) %>%
+  rowwise() %>% # take mean across row of ranks
+  mutate(Rank_mean = mean(c(Rank_bin_4, Rank_bin_5, Rank_bin_6), na.rm = TRUE)) %>%
+  rowwise() %>%
+  mutate(Score_mean = mean(c(Score_4, Score_5, Score_6), na.rm = TRUE)) %>%
+  arrange(Rank_mean, Score_mean) # Rank_mean 
+
+TF_CD4_table
+```
+
+```{r Collect results for CD8}
+TF_CD8_table <- Chea_CD8 %>%
+  filter(`Query Name` %in% c("CD8_bin5", "CD8_bin6", "CD8_bin7", "CD8_bin8")) %>%
+  select(Gene = TF, everything()) %>%
+  mutate(Score = as.numeric(Score)) %>% # necessary for ranking to work
+  mutate(Pseudotime_bin = as.integer(str_replace(`Query Name`, "CD8_bin", ""))) %>%
+  left_join(DE_smallbins_lin %>% select(Gene, non_zeros_proportion2, clusters) %>% filter(clusters %in% c(5, 6, 7, 8)), by = c("Gene", "Pseudotime_bin" = "clusters")) %>%
+  filter(non_zeros_proportion2 > 0.05) %>%
+  select(-c("non_zeros_proportion2")) %>%
+  select(-c(`Query Name`, Library, Rank, Overlapping_Genes)) %>%
+  group_by(Pseudotime_bin) %>%
+  mutate(Rank_bin = rank(Score)) %>%
+  pivot_wider(id_cols = c("Gene"), names_from = Pseudotime_bin, values_from = c(Score, Rank_bin)) %>%
+  rowwise() %>% # take mean across row of ranks
+  mutate(Rank_mean = mean(c(Rank_bin_5, Rank_bin_6, Rank_bin_7), na.rm = TRUE)) %>%
+  rowwise() %>%
+  mutate(Score_mean = mean(c(Score_5, Score_6, Score_7), na.rm = TRUE)) %>%
+  arrange(Rank_mean, Score_mean) 
+
+TF_CD8_table
+```
+
+## Combine results
+
+```{r CD4 megatable}
+CD4_megatable <- TF_CD4_table %>%
+  select(Gene, contains("Rank_bin"), contains("Score_"), Score_mean, Rank_mean) %>% 
+  mutate(TCR_pathway = Gene %in% TCR_set) %>%
+  mutate(Targets_masterreg = Gene %in% Targets_masterreg) %>%
+  left_join(DE_CD4_table, by = c("Gene")) %>%
+  pivot_wider(values_from = LFC, names_from = clusters, names_prefix = "LFC_bin_")
+```
+
+```{r CD8 megatable}
+CD8_megatable <- TF_CD8_table %>%
+  select(Gene, contains("Rank_bin"), contains("Score_"), Score_mean, Rank_mean) %>%
+  mutate(TCR_pathway = Gene %in% TCR_set) %>%
+  mutate(Targets_masterreg = Gene %in% Targets_masterreg) %>%
+  left_join(DE_CD8_table, by = c("Gene")) %>%
+  pivot_wider(values_from = LFC, names_from = clusters, names_prefix = "LFC_bin_")
+```
+
+## Plot
+
+```{r Plot CD4 megatable}
+TF_number = 50
+
+# Use TCR and is_DE as annotation
+CD4_megatable <- CD4_megatable %>%
+  arrange(Rank_mean, Score_mean)
+CD4_mat <- as.matrix(CD4_megatable[1:TF_number, c("Rank_bin_4", "Rank_bin_5", "Rank_bin_6", "Rank_bin_7")])
+row.names(CD4_mat) <- CD4_megatable[1:TF_number, "Gene"] %>% pull()
+
+# Annotation
+CD4_annotation <- (as.data.frame(CD4_megatable[1:TF_number, c("TCR_pathway", "Targets_masterreg")]))
+colnames(CD4_annotation) <- c("TCR pathway", "Targets master regulator")
+CD4_annotation$`TCR pathway` <- factor(CD4_annotation$`TCR pathway`, labels = c("No", "Yes"))
+CD4_annotation$`Targets master regulator` <- factor(CD4_annotation$`Targets master regulator`, labels = c("No", "Yes"))
+row.names(CD4_annotation) <- CD4_megatable[1:TF_number, "Gene"] %>% pull()
+
+# Add DE results to annotations (is it DE in any of the relevant time bins?)
+CD4_megatable <- CD4_megatable %>%
+  rowwise() %>%
+  mutate("Differentially expressed" = !(all(is.na((c(LFC_bin_4, LFC_bin_5, LFC_bin_6, LFC_bin_7))))))
+CD4_megatable$`Differentially expressed` <- factor(CD4_megatable$`Differentially expressed`, labels = c("No", "Yes"))
+CD4_annotation$`Differentially expressed` <- CD4_megatable[1:TF_number, "Differentially expressed"] %>% pull()
+
+annotation_colors <-  list(
+  `TCR pathway` = c(No = "white", Yes = "darkgreen"),
+  `Targets master regulator` = c(No = "white", Yes = "darkorchid4"),
+  `Differentially expressed` = c(No = "white", Yes = "darkred")
+  )
+
+pheatmap((CD4_mat),
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         show_colnames= TRUE,
+         show_rownames = TRUE,
+         cellwidth = 10,
+         cellheight = 10,
+         angle_col = 90,
+         annotation_row = (CD4_annotation),
+         labels_col = c("Pseudotime 4-5", "Pseudotime 5-6", "Pseudotime 6-7", "Pseudotime 7-8"),
+         color = colorRampPalette(brewer_pal(palette = "Blues", direction = -1)(9), bias = 2)(100), # gray na_col for NA values (< 5% cells express)
+         annotation_colors = annotation_colors,
+         #filename = str_c("figures/", "CD4_megatable_50gene", ".pdf"),
+         height = 10,
+         width = 5
+         )
+```
+
+```{r CD8 plot megatable}
+TF_number = 50
+
+# Use TCR and is_DE as annotation
+CD8_megatable <- CD8_megatable %>%
+  arrange(Rank_mean, Score_mean)
+CD8_mat <- as.matrix(CD8_megatable[1:TF_number, c("Rank_bin_5", "Rank_bin_6", "Rank_bin_7", "Rank_bin_8")])
+row.names(CD8_mat) <- CD8_megatable[1:TF_number, "Gene"] %>% pull()
+
+# Annotation
+CD8_annotation <- (as.data.frame(CD8_megatable[1:TF_number, c("TCR_pathway", "Targets_masterreg")]))
+colnames(CD8_annotation) <- c("TCR pathway", "Targets master regulator")
+CD8_annotation$`TCR pathway` <- factor(CD8_annotation$`TCR pathway`, labels = c("No", "Yes"))
+CD8_annotation$`Targets master regulator` <- factor(CD8_annotation$`Targets master regulator`, labels = c("No", "Yes"))
+row.names(CD8_annotation) <- CD8_megatable[1:TF_number, "Gene"] %>% pull()
+
+# Add DE results to annotations (is it DE in any of the relevant time bins?)
+CD8_megatable <- CD8_megatable %>%
+  rowwise() %>%
+  mutate("Differentially expressed" = !(all(is.na((c(LFC_bin_5, LFC_bin_6, LFC_bin_7, LFC_bin_8))))))
+CD8_megatable$`Differentially expressed` <- factor(CD8_megatable$`Differentially expressed`, labels = c("No", "Yes"))
+CD8_annotation$`Differentially expressed` <- CD8_megatable[1:TF_number, "Differentially expressed"] %>% pull()
+
+annotation_colors <-  list(
+  `TCR pathway` = c(No = "white", Yes = "darkgreen"),
+  `Targets master regulator` = c(No = "white", Yes = "darkorchid4"),
+  `Differentially expressed` = c(No = "white", Yes = "darkred")
+  )
+
+pheatmap((CD8_mat),
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         show_colnames= TRUE,
+         show_rownames = TRUE,
+         cellwidth = 10,
+         cellheight = 10,
+         angle_col = 90,
+         annotation_row = (CD8_annotation),
+         labels_col = c("Pseudotime 5-6", "Pseudotime 6-7", "Pseudotime 7-8", "Pseudotime 8-9"),
+         color = colorRampPalette(brewer_pal(palette = "Blues", direction = -1)(9), bias = 2)(100),
+         annotation_colors = annotation_colors,
+         #filename = str_c("figures/", "CD8_megatable_50gene", ".pdf"),
+         height = 10,
+         width = 5 
+         )
+```
+
+# Plot DE results as heatmap
+
+```{r Find cluster order}
+# CD4 order: Find average peak fold change  of clusters
+cd4_DE_heat <- DE_smallbins_lin %>%
+  arrange(clusters, desc(lfc_median)) %>%
+  inner_join(cd4_gene_clusters %>% select(Gene_cluster = Cluster, everything()), by = "Gene") %>%
+  select(Gene, lfc_median, clusters, Gene_cluster) %>%
+  pivot_wider(values_from = lfc_median, names_from = clusters, names_prefix = "Pseudotime_") %>%
+  arrange(Gene_cluster) %>%
+  
+  # Find peak and arrange
+  rowwise() %>%
+  mutate(peak_lfc = which.max(c_across(Pseudotime_0:Pseudotime_14))) %>% # find max per row
+  group_by(Gene_cluster) %>% # group by gene cluster
+  summarize(cluster_peak = mean(peak_lfc)) %>% # get mean peak per cluster
+  arrange(cluster_peak)
+
+# Get cluster order:
+cd4_cluster_order <- factor(cd4_DE_heat %>% select(Gene_cluster) %>% pull(), levels = cd4_DE_heat %>% select(Gene_cluster) %>% pull())
+
+# CD8 order: find average peak fold change  of clusters
+cd8_DE_heat <- DE_smallbins_lin %>%
+  arrange(clusters, lfc_median) %>%
+  inner_join(cd8_gene_clusters %>% select(Gene_cluster = Cluster, everything()), by = "Gene") %>%
+  select(Gene, lfc_median, clusters, Gene_cluster) %>%
+  pivot_wider(values_from = lfc_median, names_from = clusters, names_prefix = "Pseudotime_") %>%
+  arrange(Gene_cluster) %>%
+  # find peak and arrange
+  rowwise() %>%
+  mutate(peak_lfc = which.min(c_across(Pseudotime_0:Pseudotime_14))) %>% # find min per row
+  group_by(Gene_cluster) %>% # group by gene cluster
+  summarize(cluster_peak = mean(peak_lfc)) %>% # get mean peak per cluster
+  arrange((cluster_peak))
+
+# Get cluster order:
+cd8_cluster_order <- factor(cd8_DE_heat %>% select(Gene_cluster) %>% pull(), levels = cd8_DE_heat %>% select(Gene_cluster) %>% pull())
+```
+
+```{r Select DE rows to annotate}
+# For annotation
+cd4_row_labels <- c("Cd4", "Id2", "Cd5", "Gata3", "Zbtb7b", "Egr2", "Cd69") # "Egr1", "Cd40lg", 
+cd8_row_labels <- c("Cd8a", "Themis", "Runx3", "Nkg7", "Egr2", "Cd69", "Kcna2", "Tmie") # "Egr1", 
+
+cd4_labels_de <- DE_smallbins_lin %>%
+  arrange(clusters, (lfc_median)) %>%
+  inner_join(cd4_gene_clusters %>% select(Gene_cluster = Cluster, everything()), by = "Gene") %>%
+  select(Gene, lfc_median, clusters, Gene_cluster) %>%
+  pivot_wider(values_from = lfc_median, names_from = clusters, names_prefix = "Pseudotime_") %>%
+  mutate(Gene_cluster = factor(Gene_cluster, levels = cd4_cluster_order)) %>% # make gene cluster a factor that is ordered by the above levels
+  arrange(Gene_cluster) %>%
+  select(Gene) %>%
+  mutate(row_labels = case_when(Gene %in% cd4_row_labels ~ Gene,
+                                TRUE ~ "")) %>%
+  select(row_labels) %>%
+  pull()
+
+cd8_labels_de <- DE_smallbins_lin %>%
+  arrange(clusters, desc(lfc_median)) %>%
+  inner_join(cd8_gene_clusters %>% select(Gene_cluster = Cluster, everything()), by = "Gene") %>%
+  select(Gene, lfc_median, clusters, Gene_cluster) %>%
+  pivot_wider(values_from = lfc_median, names_from = clusters, names_prefix = "Pseudotime_") %>%
+  mutate(Gene_cluster = factor(Gene_cluster, levels = cd8_cluster_order)) %>% # make gene cluster a factor that is ordered by the above levels
+  arrange(Gene_cluster) %>%
+  select(Gene) %>%
+  mutate(row_labels = case_when(Gene %in% cd8_row_labels ~ Gene,
+                                TRUE ~ "")) %>%
+  select(row_labels) %>%
+  pull()
+```
+
+```{r CD4 DE heatmap}
+bin_ranges_labels <- c(`0` = "0-1",
+                             `1` = "1-2",
+                             `2` = "2-3",
+                             `3` = "3-4",
+                             `4` = "4-5",
+                             `5` = "5-6",
+                             `6` = "6-7",
+                             `7` = "7-8",
+                             `8` = "8-9",
+                             `9` = "9-10",
+                             `10` = "10-11",
+                             `11` = "11-12",
+                             `12` = "12-13",
+                             `13` = "13-14",
+                             `14` = "14-16")
+
+# Collect DE data
+cd4_DE_heat <- DE_smallbins_lin %>%
+  arrange(clusters, (lfc_median)) %>%
+  inner_join(cd4_gene_clusters %>% select(Gene_cluster = Cluster, everything()), by = "Gene") %>%
+  select(Gene, lfc_median, clusters, Gene_cluster) %>%
+  pivot_wider(values_from = lfc_median, names_from = clusters, names_prefix = "Pseudotime_") %>%
+  mutate(Gene_cluster = factor(Gene_cluster, levels = cd4_cluster_order)) %>% # make gene cluster a factor that is ordered by the above levels
+  arrange(Gene_cluster)
+
+cd4_DE_heatmat <- as.matrix(cd4_DE_heat %>% select(contains("Pseudotime")))
+row.names(cd4_DE_heatmat) <- cd4_DE_heat$Gene
+
+cd4_heatmat_labels <- as.data.frame(cd4_DE_heat$Gene_cluster)
+row.names(cd4_heatmat_labels) <- cd4_DE_heat$Gene
+colnames(cd4_heatmat_labels) <- "Gene cluster"
+
+annotation_colors_cd4de <- list("Gene cluster" = sample(stepped2(20)[10:18]))
+names(annotation_colors_cd4de[[1]]) <- as.character(seq(0,8))
+
+# PLot LFCs as a heatmap
+pheatmap(cd4_DE_heatmat,
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         show_colnames= TRUE,
+         show_rownames = TRUE,
+         cellwidth = 10,
+         angle_col = 90,
+         labels_col = bin_ranges_labels,
+         annotation_row = cd4_heatmat_labels,
+         labels_row = cd4_labels_de,
+         color = colorRampPalette(brewer_pal(palette = "RdBu", direction = -1)(9))(100),
+         annotation_colors = annotation_colors_cd4de,
+         main = "MHCII-specific DE genes",
+         annotation_names_row = FALSE,
+         breaks = c(seq(.9*min(cd4_DE_heatmat), 0, length.out=51), 
+              seq(max(cd4_DE_heatmat)/50, .9*max(cd4_DE_heatmat), length.out=50)), # set the 0 point for color, see https://stackoverflow.com/questions/31677923/set-0-point-for-pheatmap-in-r
+         #filename = str_c("figures/", "cd4_de_heatmap", ".pdf"),
+         height = 6,
+         width = 4.5,
+         fontsize_row = 10
+         )
+```
+
+```{r CD8 DE heatmap}
+# Collect DE data
+cd8_DE_heat <- DE_smallbins_lin %>%
+  arrange(clusters, desc(lfc_median)) %>%
+  inner_join(cd8_gene_clusters %>% select(Gene_cluster = Cluster, everything()), by = "Gene") %>%
+  select(Gene, lfc_median, clusters, Gene_cluster) %>%
+  pivot_wider(values_from = lfc_median, names_from = clusters, names_prefix = "Pseudotime_") %>%
+  mutate(Gene_cluster = factor(Gene_cluster, levels = cd8_cluster_order)) %>% # make gene cluster a factor that is ordered by the above levels
+  arrange(Gene_cluster)
+
+cd8_DE_heatmat <- as.matrix(cd8_DE_heat %>% select(contains("Pseudotime")))
+row.names(cd8_DE_heatmat) <- cd8_DE_heat$Gene
+
+cd8_heatmat_labels <- as.data.frame(cd8_DE_heat$Gene_cluster)
+row.names(cd8_heatmat_labels) <- cd8_DE_heat$Gene
+colnames(cd8_heatmat_labels) <- "Gene cluster"
+
+annotation_colors_cd8de <- list("Gene cluster" =  sample(stepped2(20)[1:8]))
+names(annotation_colors_cd8de[[1]]) <- as.character(seq(0,7))
+
+# PLot LFCs as a heatmap
+pheatmap(cd8_DE_heatmat,
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         show_colnames= TRUE,
+         show_rownames = TRUE,
+         cellwidth = 10,
+         angle_col = 90,
+         labels_col = bin_ranges_labels, 
+         annotation_row = cd8_heatmat_labels,
+         labels_row = cd8_labels_de, 
+         color = colorRampPalette(brewer_pal(palette = "RdBu", direction = -1)(9))(100), 
+         annotation_colors = annotation_colors_cd8de,
+         main = "MHCI-specific DE genes",
+         annotation_names_row = FALSE,
+         breaks = c(seq(.9*min(cd8_DE_heatmat), 0, length.out=51), 
+              seq(max(cd8_DE_heatmat)/50, .9*max(cd8_DE_heatmat), length.out=50)), 
+         #filename = str_c("figures/", "cd8_de_heatmap", ".pdf"),
+         height = 6,
+         width = 4.5,
+         fontsize_row = 10
+         )
+```
+# Enrichment of TCR signaling in gene clusters
+
+```{r Hypergeometric test for CD4 clusters}
+cd4_gene_clusters$Cluster <- as.factor(cd4_gene_clusters$Cluster)
+
+p_values <- c()
+for (cluster in levels(cd4_gene_clusters$Cluster)) {
+  DE_geneset <- cd4_gene_clusters %>%
+    filter(Cluster == cluster) %>%
+    select(Gene) %>%
+    pull()
+  overlap <- length(intersect(DE_geneset, TCR_sig))
+  hyper_out <- phyper(q = overlap - 1, m = length(TCR_sig), n = length(totalVI_genes) - length(TCR_sig), k = length(DE_geneset),
+       lower.tail = FALSE, log.p = FALSE)
+  p_values <- c(p_values, hyper_out)
+  print(str_c("Cluster: ", cluster, ", p-value: ", hyper_out))
+}
+
+p_values_adjusted <- p.adjust(p_values, method = "BH")
+names(p_values_adjusted) <- levels(cd4_gene_clusters$Cluster)
+p_values_adjusted
+```
+
+```{r Hypergeometric test for CD8 clusters}
+cd8_gene_clusters$Cluster <- as.factor(cd8_gene_clusters$Cluster)
+
+p_values <- c()
+for (cluster in levels(cd8_gene_clusters$Cluster)) {
+  DE_geneset <- cd8_gene_clusters %>%
+    filter(Cluster == cluster) %>%
+    select(Gene) %>%
+    pull()
+  overlap <- length(intersect(DE_geneset, TCR_sig))
+  hyper_out <- phyper(q = overlap - 1, m = length(TCR_sig), n = length(totalVI_genes) - length(TCR_sig), k = length(DE_geneset),
+       lower.tail = FALSE, log.p = FALSE)
+  p_values <- c(p_values, hyper_out)
+  print(str_c("Cluster: ", cluster, ", p-value: ", hyper_out))
+}
+
+p_values_adjusted <- p.adjust(p_values, method = "BH")
+names(p_values_adjusted) <- levels(cd8_gene_clusters$Cluster)
+p_values_adjusted
+```
+
+# Stat5 signature
+
+```{r Load Stat5 signature}
+hallmark_sig_file <- "/data/yosef/users/zsteier/references/Signatures/h.all.v7.0.symbols.gmt"
+# https://www.gsea-msigdb.org/gsea/msigdb/mouse/geneset/HALLMARK_IL2_STAT5_SIGNALING.html
+
+sig_string <- "Cd86,Traf1,Pou2f1,Ecm1,Serpinb6a,Cish,Fgl2,Tiam1,Tnfrsf4,Cdkn1c,Penk,Rora,Gpx4,Ltb,Ahr,Slc1a5,Il4ra,Ptch1,Adam19,Il18r1,Nrp1,Myo1c,Myo1e,Tnfsf10,Capn3,Scn9a,Ifngr1,Casp3,Gadd45b,Ccr4,Nop2,Lrig1,Emp1,Rhob,Gpr65,Rgs16,Plpp1,Ncs1,Mapkapk2,Nfil3,Bmpr2,Cd81,Irf4,Phlda1,Bhlhe40,Capg,Amacr,Rragd,Hycc2,She,Tnfsf11,Plagl1,Tnfrsf9,Rnh1,Dennd5a,Eomes,Map6,Socs2,Ncoa3,Plec,Coch,F2rl2,Cst7,Itgae,Umps,Swap70,Alcam,Hipk2,Tnfrsf1b,Hk2,Dhrs3,Ahnak,St3gal4,Cd83,Syngr2,Cyfip1,P2rx4,S100a1,Csf2,Csf1,Ndrg1,Gsto1,Ikzf2,Ikzf4,Spry4,Cdc6,Slc29a2,Klf6,Map3k8,Cxcl10,Rabgap1l,Socs1,Icos,Batf,Irf6,Syt11,Praf2,Gucy1b1,Ctsz,Ifitm3,Snx9,Slc39a8,Gabarapl1,Eef1akmt1,Pdcd2l,Sh3bgrl2,Wls,Phtf2,Dcps,Hopx,Ttc39b,Glipr2,Cdc42se2,Rhoh,Batf3,Itih5,Gbp3,Huwe1,Pus1,Smpdl3a,Nfkbiz,Uck2,Twsg1,Lrrc8c,Spred2,Tnfrsf21,Snx14,Tlr7,Cdcp1,Galm,Etfbkmt,Ptrh2,Ckap4,Lclat1,Drc1,Ahcyl,Plin2,Anxa4,Aplp1,Serpinc1,Bcl2,Bcl2l1,Bmp2,Car2,Ccnd2,Ccnd3,Ccne1,Cd44,Cd48,Col6a1,Ctla4,Plscr1,Ager,Tnfrsf18,Eno3,Fah,Flt3l,Gata1,Gpr83,Slc2a3,Irf8,Cd79b,Igf1r,Igf2r,Il10,Il10ra,Il13,Il1r2,Il2ra,Il2rb,Il3ra,Itga6,Itgav,Lif,Mxd1,Maff,Muc1,Myc,Pnp,Enpp1,Odc1,P4ha1,Furin,Abcb1a,Pim1,Prkch,Prnp,Ptger2,Pth1r,Sell,Selp,Spp1,Il1rl1,Tgm2,Xbp1,Etv4,Arl4a,Nt5e,Tnfrsf8"
+sig_list <- str_split(sig_string, ",")
+```
+
+```{r Plot average expression of signature}
+Stat5_genes_annotated <- denoised_genes_annotated %>%
+  filter(Gene %in% sig_list[[1]]) %>%
+  group_by(mean_pseudotime, Lineage_by_genotypeSlingshot) %>% ## group by Cluster, time, lineage and take mean
+  summarize(sig_mean = mean(value))
+
+# Plot by loess, facet by cluster
+ggplot(Stat5_genes_annotated, aes(x = mean_pseudotime, y = sig_mean, color = Lineage_by_genotypeSlingshot)) +
+  geom_smooth(method = "loess", span = .5, se = FALSE) +
+  scale_color_manual(values = c(redcol, bluecol)) +
+  labs(x = "Pseudotime", y = "Mean scaled\n denoised expression", color = "Lineage", title = "Hallmark Il2-Stat5 Signaling") +
+  theme_classic()
+ggsave("figures/Stat5_signature_pseudotime.pdf", bg = "transparent", height = 2, width = 4)
+```

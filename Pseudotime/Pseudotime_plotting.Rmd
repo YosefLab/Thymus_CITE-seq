@@ -1,0 +1,921 @@
+---
+title: "Pseudotime plotting"
+output: html_notebook
+---
+
+Zoë Steier
+
+* Pseudotime plots
+* In-silico gating
+
+# Load packages
+
+```{r Load packages}
+library(tidyverse)
+library(scales)
+library(RColorBrewer)
+library(pROC)
+library(slingshot)
+
+packageVersion("tidyverse")
+packageVersion("scales")
+packageVersion("RColorBrewer")
+packageVersion("pROC")
+packageVersion("slingshot")
+```
+
+# Load data
+
+```{r Load totalVI data}
+totalvi_path <- "/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/totalVI_thymus/thymus111_allbatches_stable_posselecting/totalVI_results/"
+
+latent <- read_csv(gzfile(str_c(totalvi_path, "latent.csv.gz")))
+umap_totalVI <- read_csv(gzfile(str_c(totalvi_path, "umap.csv.gz")))
+
+denoised_proteins <- read_csv(gzfile(str_c(totalvi_path, "denoised_proteins.csv.gz")))
+denoised_genes <- read_csv(gzfile(str_c(totalvi_path, "denoised_genes.csv.gz")))
+
+totalVI_genes <- read_csv(gzfile(str_c(totalvi_path, "totalVI_genes.csv.gz")))
+totalVI_proteins <- read_csv(gzfile(str_c(totalvi_path, "totalVI_proteins.csv.gz")))
+
+#raw_proteins <- read_csv(gzfile(str_c(totalvi_path, "raw_proteins.csv.gz")))
+#raw_genes <- read_csv(gzfile(str_c(totalvi_path, "raw_genes.csv.gz")))
+
+obs <- read_csv(gzfile(str_c(totalvi_path, "obs.csv.gz")))
+
+meta_csv <- read_csv("/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/metadata/Metadata_SeqStats_totalSeq_experiments.csv")
+meta_thymus <- meta_csv %>%
+  filter(Tissue == "thymus") %>%
+  filter(TotalSeq_panel == "ADT111") 
+meta_thymus <- meta_thymus %>%
+  mutate(Batch = seq(1, dim(meta_thymus)[1]) - 1) # rename batches starting at 0 (19 batches in total)
+```
+
+```{r Load filtered data}
+filt_path <- "/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/Annotation_thymus/"
+
+obs_filtered <- read_csv(gzfile(str_c(filt_path, "adata_positiveselection_filt_obs.csv.gz")))
+
+filtered_cells <- obs_filtered$X1
+# length(unique(filtered_cells)) # 29408
+```
+
+```{r Parse totalVI data}
+# Extract: clusters, UMAP, denoised proteins, latent, etc.
+# Remove first column of dataframes - this is an index column coming from python
+
+# totalVI UMAP
+totalvi_umap <- as.data.frame(umap_totalVI[, -1])
+colnames(totalvi_umap) <- c("UMAP1", "UMAP2")
+row.names(totalvi_umap) <- obs$X1
+
+# totalVI latent space
+totalvi_latent <- as.matrix(latent[, -1])
+row.names(totalvi_latent) <- obs$X1
+
+# totalVI denoised proteins
+denoised_proteins <- denoised_proteins %>%
+  select(-c(X1))
+colnames(denoised_proteins) <- totalVI_proteins[, 2][[1]]
+denoised_proteins <- denoised_proteins %>%
+  mutate(Barcode = obs$X1)
+
+# totalVI denoised genes
+denoised_genes <- denoised_genes %>%
+  select(-c(X1))
+colnames(denoised_genes) <- totalVI_genes[, 2][[1]]
+denoised_genes <- denoised_genes %>%
+  mutate(Barcode = obs$X1)
+
+# # Raw genes
+# raw_genes <- raw_genes %>%
+#   select(-c(X1))
+# colnames(raw_genes) <- totalVI_genes[, 2][[1]]
+# raw_genes <- raw_genes %>%
+#   mutate(Barcode = obs$X1)
+# 
+# # Raw proteins
+# raw_proteins <- raw_proteins %>%
+#   select(-c(X1))
+# colnames(raw_proteins) <- totalVI_proteins[, 2][[1]]
+# raw_proteins <- raw_proteins %>%
+#   mutate(Barcode = obs$X1)
+```
+
+```{r Make metadata from totalVI}
+# totalVI Leiden clusters and metadata
+totalVI_meta <- obs %>%
+  select(Batch = 'batch_indices', UMIs_RNA = "n_counts", UMIs_protein = "n_protein_counts",
+          'n_genes', 'n_proteins', 'percent_mito', contains("leiden_totalVI_"), Barcode = "X1") %>%
+  mutate_at(vars(contains("leiden_totalVI_")), as_factor) %>% # Convert cluster labels to factors
+  left_join(meta_thymus %>% select(Sample, Genotype, Experiment, Replicate, Location, Batch), by = "Batch") %>% # Join with experimental metadata
+  mutate(Mouse = str_c(Genotype, "_", Replicate)) %>% # Add mouse information
+  mutate_at(c("Sample", "Batch", "Mouse", "Experiment", "Genotype", "Location"), as_factor) %>% # Set as factors to preserve the order of levels
+  select(-"Replicate")
+```
+
+```{r Load pseudotime data}
+pseudotime_data <- read_csv("pseudotime_slingshot_2020913.csv", col_types = cols(Lineage_by_genotype = col_character(), 
+                                                                                  Lineage_by_genotypeSlingshot = col_character()))
+time_bins <- pseudotime_data %>%
+  mutate(Pseudotime_bin = cut(mean_pseudotime, breaks = seq(0,16, by = 2), include.lowest = TRUE,
+                              labels = str_c(as.character(seq(0, 7)))))
+
+# Assign cells with pseudotime > 16 to the last bin
+time_bins[is.na(time_bins$Pseudotime_bin), "Pseudotime_bin"] <- "7" # This is exactly 20 cells
+
+pseudotime_data
+```
+
+# Plot filtering UMAP
+
+```{r Label clusters to remove}
+colnames(obs)[1] <- "Barcode"
+colnames(obs_filtered)[1] <- "Barcode"
+
+cd8_outliers <- obs$Barcode[!(obs$Barcode %in% obs_filtered$Barcode)]
+
+
+filtering_labels <- as_tibble(totalvi_umap, rownames = "Barcode") %>%
+  left_join(obs, by = "Barcode") %>%
+  mutate(Filtered_labels = factor(case_when(leiden_totalVI_res1.4 == "22" ~ "Interferon sig.",
+                                     leiden_totalVI_res1.4 == "19" ~ "Doublet",
+                                     leiden_totalVI_res1.4 == "16" ~ "Cycling",
+                                     leiden_totalVI_res1.4 == "21" ~ "GD-like",
+                                     leiden_totalVI_res1.4 == "5" ~ "Neg. sel. (2)",
+                                     leiden_totalVI_res0.6 == "6" ~ "Treg",
+                                     leiden_totalVI_res0.6 == "8" ~ "Interferon sig.",
+                                     leiden_totalVI_res0.6 == "9" ~ "Doublet",
+                                     Barcode %in% cd8_outliers ~ "CD8tg outliers",
+                                     TRUE ~ "Positively-selecting"), levels = c("CD8tg outliers", "Cycling", "Doublet", "GD-like", "Interferon sig.", "Neg. sel. (2)",
+                                                                              "Treg", "Positively-selecting")))
+```
+
+```{r Plot labeled cells}
+ggplot(filtering_labels, aes(x = UMAP1, y = UMAP2, color = Filtered_labels)) +
+  geom_point(stroke = 0, size = .4) +
+  scale_color_manual(values = c(hue_pal()(7), "gray50")) +
+  theme_classic() +
+  labs(color = "") +
+  guides(colour = guide_legend(override.aes = list(size=2))) +
+  coord_equal()
+
+ggsave("/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/Annotation_thymus/figures/annotate_positiveselection_filter.png", 
+       bg = "transparent", height = 4, width = 6, dpi = 1000) 
+```
+
+# Pseudotime plotting
+## Prepare data
+
+```{r Pseudotime metadata}
+pseudotime_data <- time_bins %>% # pseudotime_data, but now add in time bins
+  mutate(Lineage_by_genotypeWT = Lineage_by_genotype) %>%
+  mutate(Lineage_by_genotypeWT = case_when(is.na(Lineage_by_genotypeWT) ~ "WT",
+                                           !(is.na(Lineage_by_genotypeWT)) ~ Lineage_by_genotypeWT))
+
+# Clean up the lineages by removing the "wrong lineage cells" and keeping the WT cells
+pseudotime_data <- pseudotime_data %>%
+  mutate(Lineage_by_genotypeSlingshotWT = Lineage_by_genotypeSlingshot) %>%
+  mutate(Lineage_by_genotypeSlingshotWT = case_when(Lineage_by_genotypeWT == "WT" ~ "WT", 
+                                           !(Lineage_by_genotypeWT == "WT") ~ Lineage_by_genotypeSlingshot)) # if it is not WT, it is either CD4, CD8, or NA
+
+table(pseudotime_data$Lineage_by_genotypeSlingshotWT)
+#sum(is.na(pseudotime_data$Lineage_by_genotypeSlingshotWT)) # 1050 wrong lineage cells
+```
+
+```{r Merge genes and meta}
+denoised_annotated <- denoised_genes %>%
+  left_join(pseudotime_data %>% select(Barcode, mean_pseudotime, Lineage_by_genotypeSlingshotWT, Genotype, Mouse), by = "Barcode") %>% # add mouse for revision 2
+  filter(Lineage_by_genotypeSlingshotWT %in% c("CD4", "CD8", "WT"))
+```
+
+```{r Scale genes}
+genes_to_plot <- c("Rag1", "Rag2", "Cxcr4", "Ccr7", "Runx3", "Zbtb7b", "Cd4", "Cd8a", "Cd8b1", "Trbc1", "Ccr4", "Ccr9", "Cd24a", "H2-K1", "Klf2", "S1pr1", "Cd55", "Cd5", "Cd69", "Bcl2", "Sell", "Gata3", "Il7r", 
+                   "Id2", "Id3", "Cd40lg", "Dusp2", "Nr4a1", "Kcna2", "Tmie", "Themis", "Dusp5",
+                   "Nfatc2", "Nfatc1", "Nfatc3", "Nfat5", "Egr1", "Egr2", "Egr3", "Ets1", "Stat5a", "Stat5b",
+                   "Tcf3", "Tcf12",
+                   "Batf", "Cd28", "Lef1", "Mapk11", "Ikzf2", "Nfkb2", "Relb",
+                   "Tesc",
+                   "Ndrg1", "Hivep3", "Cd6",
+                    "Socs1", "Socs3", "Tox", "Myb",
+                   "Ccnd2", "Ltb", "Ccnd3", "Ikzf2", "Cish", "Pim1")
+
+# Scaling to 98th percentile so the scale isn't biased by high outliers
+scale_98 <- function(x, na.rm = TRUE) {rescale(x, to = c(0,1), from = c(min(x), quantile(x, .98)))}
+
+denoised_annotated_scaled <- denoised_annotated %>%
+  select(all_of(genes_to_plot), Lineage_by_genotypeSlingshotWT, mean_pseudotime, Genotype, Mouse) %>%
+  mutate_at(genes_to_plot, scale_98) %>% # scale is standard scaling, rescale is min/max scaling to 0,1
+ pivot_longer(cols = all_of(genes_to_plot), names_to = "Gene")
+```
+
+```{r Add protein data}
+denoised_prot_annotated <- denoised_proteins %>%
+  left_join(pseudotime_data %>% select(Barcode, mean_pseudotime, Lineage_by_genotypeSlingshotWT, Genotype, Mouse), by = "Barcode") %>%
+  filter(Lineage_by_genotypeSlingshotWT %in% c("CD4", "CD8", "WT"))
+
+proteins_to_plot <- c("ADT_CD4_A0001", "ADT_CD8a_A0002", "ADT_CD8b(Ly-3)_A0230", "ADT_CD24_A0212", "ADT_CD5_A0111", "ADT_CD69_A0197", "ADT_TCRbchain_A0120",
+                      "ADT_CD55(DAF)_A0558", "ADT_integrinb7_A0214",
+                      "ADT_CD127(IL-7Ra)_A0198", "ADT_CD62L_A0112")
+
+denoised_annotated_prot_scaled <- denoised_prot_annotated %>%
+  select(all_of(proteins_to_plot), Lineage_by_genotypeSlingshotWT, mean_pseudotime, Genotype, Mouse) %>%
+  mutate_at(proteins_to_plot, scale_98) %>%
+  pivot_longer(cols = all_of(proteins_to_plot), names_to = "Gene")
+
+# Combine RNA and protein data for plotting
+denoised_all <- rbind(denoised_annotated_prot_scaled, denoised_annotated_scaled) %>%
+  mutate(Feature = str_replace(str_replace(str_replace(Gene, "ADT_", ""), "_A[0-9]*", ""), "[(].*", ""))
+```
+
+```{r Plotting settings}
+redcol <- brewer.pal(3, "Set1")[1]
+bluecol <- brewer.pal(3, "Set1")[2]
+greencol <- brewer.pal(3, "Set1")[3]
+```
+
+## Plot TCR target genes over pseudotime
+
+```{r TCR targets}
+tcr_targets <- factor(c("Cd5", "Dusp5", "Gata3", "Cd69", "Cd28", "Egr1", "Lef1", "Nr4a1"), levels = c("Cd5", "Dusp5", "Gata3", "Cd69", "Cd28", "Egr1", "Lef1", "Nr4a1"))
+
+denoised_all_arranged_tcr <- denoised_all %>% 
+  filter(Feature %in% tcr_targets, Lineage_by_genotypeSlingshotWT %in% c("CD4", "CD8")) %>% 
+  mutate(Feature = factor(Feature, levels = levels(tcr_targets))) %>%
+  arrange(factor(Feature, levels = tcr_targets))
+
+ggplot(denoised_all_arranged_tcr, aes(x = mean_pseudotime, y = value, color = Lineage_by_genotypeSlingshotWT)) +
+  geom_smooth(se = FALSE, method = "loess", span = 0.5) +
+  scale_color_manual(values = c(redcol, bluecol)) +
+  facet_wrap("Feature", scales = "free_y", ncol = 2) +
+  theme_classic() +
+  labs(x = "Pseudotime", color = "Lineage", y = "Scaled denoised RNA expression", title = "TCR targets")
+
+ggsave("/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/DE_thymus/figures/tcr_targets.pdf", bg = "transparent", height = 5, width = 2)
+```
+
+## Plot calibrated feature examples
+
+```{r Plot calibrated feature examples}
+calibrated_features <- denoised_all %>% 
+  mutate(Feature = str_replace(str_replace(Gene, "ADT_", ""), "_A[0-9]*", "")) %>% # include CD55(DAF)
+  filter(Feature %in% c("Rag1", "Cxcr4", "Trbc1", "Ccr9", "Ccr4", "Ccr7", "H2-K1", "Klf2", "S1pr1", "CD24", "CD62L", "CD55(DAF)"), Lineage_by_genotypeSlingshotWT %in% c("CD4", "CD8")) 
+calibrated_features$Feature <- factor(calibrated_features$Feature, levels = c("Rag1", "Cxcr4", "Trbc1", "Ccr9", "Ccr4", "Ccr7", "H2-K1", "Klf2", "S1pr1", "CD24", "CD62L", "CD55(DAF)"))
+
+ggplot(calibrated_features, aes(x = mean_pseudotime, y = value, color = Lineage_by_genotypeSlingshotWT)) + 
+  geom_smooth(se = FALSE, method = "loess", span = 0.5) +
+  scale_color_manual(values = c(redcol, bluecol)) +
+  facet_wrap("Feature", scales = "free_y", ncol = 3) +
+  theme_classic() +
+  labs(x = "Pseudotime", color = "Lineage", y = "Scaled denoised expression")
+
+ggsave("figures/calibrated_features.pdf", bg = "transparent", height = 4.5, width = 4.5)
+```
+
+## Plot coreceptors, transcription factors, and TCR signaling molecules over pseudotime
+
+```{r Plot coreceptors, TFs, and TCR response}
+# Add facet labels
+lineage_labels <- c("MHCII-specific", "MHCI-specific")
+names(lineage_labels) <- c("CD4", "CD8")
+
+# Coreceptors
+ggplot() +
+  geom_smooth(denoised_all %>% filter(Feature %in% c("CD4", "CD8a", "Cd4", "Cd8a"),
+                                            Lineage_by_genotypeSlingshotWT %in% c("CD4", "CD8")), 
+       mapping = aes(x = mean_pseudotime, y = value, color = Feature, linetype = Feature), se = FALSE, method = "loess", span = 0.5, size = .8) +
+  facet_wrap("Lineage_by_genotypeSlingshotWT", ncol = 1, labeller = labeller(Lineage_by_genotypeSlingshotWT = lineage_labels)) +
+  theme_classic() +
+  scale_color_manual(values = c("#F8766D", "#F8766D", "#00B6EB", "#00B6EB"), labels = c("Cd4", "CD4", "Cd8a", "CD8a")) +
+  scale_linetype_manual(labels = c("Cd4", "CD4", "Cd8a", "CD8a"), values = c("longdash", "solid", "longdash", "solid")) +
+  scale_x_continuous(breaks = seq(0, 15, 1), minor_breaks = NULL) +
+  labs(x = "Pseudotime", color = "Feature", y = "Scaled denoised expression", linetype = "Feature")
+ggsave("figures/timing_coreceptors_rev1.pdf", bg = "transparent", height = 3.5, width = 5)
+
+# Transcription factors
+ggplot() +
+  stat_smooth(denoised_all %>% filter(Feature %in% c("Gata3", "Zbtb7b", "Runx3"),
+                                            Lineage_by_genotypeSlingshotWT %in% c("CD4", "CD8")), 
+       mapping = aes(x = mean_pseudotime, y = value, color = Feature, linetype = Feature), geom = "line", se = FALSE, method = "loess", span = 0.5, size = .8) +
+  facet_wrap("Lineage_by_genotypeSlingshotWT", ncol = 1, labeller = labeller(Lineage_by_genotypeSlingshotWT = lineage_labels)) +
+  theme_classic() +
+  scale_x_continuous(breaks = seq(0, 15, 1), minor_breaks = NULL) +
+  scale_color_manual(values = c("#A58AFF", "#00C094", "#FB61D7"), labels = c("Gata3", "Runx3", "Zbtb7b")) +
+  scale_linetype_manual(labels = c("Gata3", "Runx3", "Zbtb7b"), values = c("longdash", "longdash", "longdash")) +  
+  labs(x = "Pseudotime", color = "Feature", y = "Scaled denoised expression", linetype = "Feature")  
+ggsave("figures/timing_masterregs_coreceptors_rev1.pdf", bg = "transparent", height = 3.5, width = 5)
+
+# TCR response
+ggplot() +
+  stat_smooth(denoised_all %>% filter(Feature %in% c("Cd69", "Egr1"),
+                                            Lineage_by_genotypeSlingshotWT %in% c("CD4", "CD8")), 
+       mapping = aes(x = mean_pseudotime, y = value, color = Feature, linetype = Feature), geom = "line", se = FALSE, method = "loess", span = 0.5, size = .8) +
+  facet_wrap("Lineage_by_genotypeSlingshotWT", ncol = 1, labeller = labeller(Lineage_by_genotypeSlingshotWT = lineage_labels)) +
+  theme_classic() +
+  scale_x_continuous(breaks = seq(0, 15, 1), minor_breaks = NULL) +
+  scale_color_manual(values = c("Cd69" = "#C49A00", "Egr1" = "#53B400"),
+                     breaks = c("Cd69", "Egr1")) + 
+  scale_linetype_manual(values = c("Cd69" = "longdash", "Egr1" = "longdash"),
+                        breaks = c("Cd69", "Egr1")) + 
+  labs(x = "Pseudotime", color = "Feature", y = "Scaled denoised expression", linetype = "Feature")  
+ggsave("figures/timing_tcrresponse_masterregs_coreceptors_rev1.pdf", bg = "transparent", height = 3.5, width = 5)
+```
+## Plot RNA vs protein example (CD69)
+
+```{r CD69}
+# Pseudotime plot for CD69 RNA/protein to highlight RNA changes precede protein
+
+# Add facet labels
+lineage_labels <- c("MHCII-specific", "MHCI-specific")
+names(lineage_labels) <- c("CD4", "CD8")
+
+ggplot() +
+  geom_smooth(denoised_all %>% filter(Feature %in% c("Cd69", "CD69"),
+                                            Lineage_by_genotypeSlingshotWT %in% c("CD4", "CD8")), 
+       mapping = aes(x = mean_pseudotime, y = value, linetype = Feature), se = FALSE, method = "loess", span = 0.5, size = .8, color = "#C49A00") +  
+  facet_wrap("Lineage_by_genotypeSlingshotWT", ncol = 1, labeller = labeller(Lineage_by_genotypeSlingshotWT = lineage_labels)) +
+  theme_classic() +
+  scale_color_manual(values = c("#C49A00", "#C49A00"), labels = c("Cd69 RNA", "CD69 protein")) +
+  scale_linetype_manual(labels = c("Cd69 RNA", "CD69 Protein"), values = c("longdash", "solid")) +
+  scale_x_continuous(breaks = seq(0, 15, 1), minor_breaks = NULL) +
+  labs(x = "Pseudotime", color = "Feature", y = "Scaled denoised expression", linetype = "Feature")
+
+ggsave("figures/timing_CD69_RNA_protein.pdf", bg = "transparent", height = 3.5, width = 5)
+```
+
+## Plot features over pseudotime
+```{r By genotype}
+markers_by_genotype <- factor(c("Cd4", "Cd8a", "Cd8b1", "Cd5", "Cd69", "Il7r",
+                         "CD4", "CD8a", "CD8b", "CD5", "CD69", "CD127",
+                         "Egr1", "Egr2", "Id2", "Id3", "Tcf12", "Tcf3",
+                         "Gata3", "Zbtb7b", "Runx3", "Dusp2", "Dusp5", "Lef1"))
+
+denoised_all_arranged <- denoised_all %>% 
+  filter(Feature %in% markers_by_genotype, Lineage_by_genotypeSlingshotWT %in% c("CD4", "CD8")) %>% 
+  arrange(factor(Feature, levels = markers_by_genotype)) %>%
+  mutate(Feature = factor(Feature, levels = markers_by_genotype)) %>%
+  mutate(Genotype = factor(recode(Genotype, B2M = "MHCI-/-", MHC2 = "MHCII-/-", OT1 = "OT-I", "OT2" = "OT-II"), levels = c("B6", "AND", "OT-II", "MHCI-/-", "F5", "OT-I", "MHCII-/-")))
+
+ggplot(denoised_all_arranged,
+       aes(x = mean_pseudotime, y = value, color = Genotype)) +
+  geom_smooth(se = FALSE, method = "loess", span = 0.5, size = .6) +
+  scale_color_manual(values = c("#fddbc7", "#ef8a62", "#b2182b", "#d1e5f0", "#67a9cf", "#2166ac")) + 
+  facet_wrap("Feature", scales = "free_y", ncol = 6) +
+  theme_classic() +
+  labs(x = "Pseudotime", color = "Genotype", y = "Scaled denoised expression")
+
+ggsave("figures/markers_by_genotype_pseudotime_rev1.pdf", bg = "transparent", height = 5, width = 10)
+```
+
+# In-silico FACS
+## Create gates
+
+```{r Log protein counts for FACS}
+denoised_proteins_facs <- denoised_proteins
+
+# Shorten protein names for plotting
+short_names <- str_replace(str_replace(names(denoised_proteins_facs[, 1:dim(denoised_proteins_facs)[2]-1]), "ADT_", ""), "_A[0-9]*", "")
+colnames(denoised_proteins_facs) <- c(short_names, "Barcode")
+
+denoised_proteins_facs[, 1:dim(denoised_proteins_facs)[2]-1] <- log1p(denoised_proteins_facs[, 1:dim(denoised_proteins_facs)[2]-1])   # take log of all proteins 
+denoised_proteins_facs <- denoised_proteins_facs %>%
+  left_join(pseudotime_data %>% select(Barcode, mean_pseudotime, Pseudotime_bin, Lineage_by_genotypeSlingshotWT, Genotype, Mouse, UMAP1, UMAP2), by = "Barcode") %>% 
+  filter(Lineage_by_genotypeSlingshotWT %in% c("CD4", "CD8", "WT"))
+
+denoised_proteins_facs <- rename(denoised_proteins_facs, "Lineage" = Lineage_by_genotypeSlingshotWT)
+denoised_proteins_facs$Lineage <- factor(denoised_proteins_facs$Lineage, levels = c("WT", "CD4", "CD8"))
+```
+
+```{r Prepare RNA data}
+denoised_rna_facs <- denoised_genes %>%
+  select(Gata3, Runx3, Zbtb7b, Il7r, Egr1, Cd69, Cd4, Cd8a, Barcode)
+
+denoised_facs <- denoised_proteins_facs %>%
+  left_join(denoised_rna_facs, by = "Barcode")
+
+denoised_facs <- denoised_facs %>% # add log of RNA values
+  mutate(Gata3_log = log(Gata3)) %>%
+  mutate(Runx3_log = log(Runx3)) %>%
+  mutate(Zbtb7b_log = log(Zbtb7b)) %>%
+  mutate(Il7r_log = log(Il7r)) %>%
+  mutate(Cd69_log = log(Cd69)) %>%
+  mutate(Egr1_log = log(Egr1)) 
+```
+
+```{r Make gates}
+denoised_facs <- denoised_facs %>%
+  mutate(CD24_gate = case_when(CD24 > 2.5 ~ "CD24+",
+                               CD24 < 2.5 ~ "CD24-"))
+
+denoised_facs <- denoised_facs %>%
+  mutate(IL7Ra_gate = case_when(`CD127(IL-7Ra)` < 0.9 ~ "CD127-",
+                               `CD127(IL-7Ra)` > 0.9 ~ "CD127+"))
+
+denoised_facs <- denoised_facs %>%
+  mutate(CD69_gate = case_when(CD69 < 2.55 ~ "CD69-",
+                               CD69 > 2.55 ~ "CD69+"))
+
+denoised_facs <- denoised_facs %>%
+  mutate(CD4_CD8_gate = case_when(CD4 > 4.4 & CD8a > 4.4 ~ "DP",
+                                  CD4 > 4.4 & CD8a < 4.4 & CD8a > 2.6 ~ "CD4+CD8low",
+                                  CD8a > 4.4 & CD4 < 4.4 & CD4 > 2.6 ~ "CD4lowCD8+",
+                                  CD4 > 4.4 & CD8a < 2.6 ~ "CD4+",
+                                  CD8a > 4.4 & CD4 < 2.6 ~ "CD8+"))
+```
+
+```{r Combine gates}
+denoised_facs <- denoised_facs %>%
+  mutate(CD127_gate = IL7Ra_gate)
+
+denoised_facs_combined <- denoised_facs %>%
+  unite("combined_gate", c("CD4_CD8_gate", "CD69_gate", "CD127_gate"), remove = FALSE)
+
+denoised_facs_combined <- denoised_facs_combined %>%
+  unite("CD127_CD69_gate", c("CD127_gate", "CD69_gate"), remove = FALSE)
+```
+
+```{r Add TCRb gate}
+denoised_facs_combined <- denoised_facs_combined %>%
+  mutate(TCRbchain_gate = case_when(TCRbchain > 3.8 ~ "TCRbhi",
+                                    TCRbchain < 3.8 ~ "TCRblo"))
+```
+
+```{r Alternative gate without CD127}
+denoised_facs_combined <- denoised_facs_combined %>%
+  unite("combined_CD4_CD8_CD69", c("CD4_CD8_gate", "CD69_gate"), remove = FALSE)
+denoised_facs_combined$Lineage <- factor(denoised_facs_combined$Lineage, levels = c("WT", "CD4", "CD8"))
+```
+
+```{r New gates v4}
+denoised_facs_combined <- denoised_facs_combined %>%
+  mutate(summary_gates_v4 = case_when(combined_gate %in% c("DP_CD69-_CD127-") ~ "DP1", 
+                                   ((combined_gate %in% c("DP_CD69+_CD127-"))) ~ "DP2", 
+                                   combined_CD4_CD8_CD69 %in% c("CD4+CD8low_CD69+") ~ "CD4+CD8low", 
+                                   ((combined_gate %in% c("DP_CD69+_CD127+")) & (TCRbchain_gate == "TCRbhi")) ~ "DP3", 
+                                   combined_gate %in% c("CD8+_CD69+_CD127+", "CD4lowCD8+_CD69+_CD127+") ~ "SemimatureCD8", 
+                                   combined_gate %in% c("CD4+_CD69+_CD127+") ~ "SemimatureCD4",
+                                   combined_gate %in% c("CD8+_CD69-_CD127+", "CD4lowCD8+_CD69-_CD127+") ~ "MatureCD8", 
+                                   combined_gate %in% c("CD4+_CD69-_CD127+") ~ "MatureCD4" )) 
+
+denoised_facs_combined$summary_gates_v4 <- factor(denoised_facs_combined$summary_gates_v4,
+                                               levels = c("DP1", "DP2", "CD4+CD8low", "DP3", "SemimatureCD4", "SemimatureCD8", "MatureCD4", "MatureCD8"))
+```
+
+```{r Plot histogram of gates over pseudotime}
+ggplot(denoised_facs_combined %>% filter(!(is.na(summary_gates_v4))), aes(x = mean_pseudotime, fill = summary_gates_v4)) +
+  geom_histogram(bins = 30) +
+  labs(x = "Pseudotime", y = "Cells", fill = "Gate") +
+  scale_fill_manual(values = gate_colors) +
+  xlim(-.1, 16.1) +
+  facet_grid(rows= vars(summary_gates_v4), cols = vars(Lineage), switch = "y")+
+  theme_light() +
+  theme(strip.text.y.left = element_text(angle = 0))
+
+ggsave("figures/histogram_gated_facet_lineage.png", dpi = 1000, bg = "transparent", height = 4.5, width = 7)
+```
+
+## Schematic timeline
+
+```{r Find thresholds for gates v4}
+# Pseudotime thresholds between populations for schematic timeline
+
+# DP1 to DP2 in all cells
+threshold_data <- denoised_facs_combined %>%
+  select(summary_gates_v4, mean_pseudotime, Lineage) %>%
+  filter(summary_gates_v4 %in% c("DP1", "DP2")) %>%
+  select(response = summary_gates_v4, predictor = mean_pseudotime)
+
+roc1 <- roc(threshold_data, response = response, predictor = predictor)
+thresh1 <- coords(roc1, "best", ret = "threshold", best.method = "youden")[[1]]
+
+# DP2 to CD4+CD8low in all cells
+threshold_data <- denoised_facs_combined %>%
+  select(summary_gates_v4, mean_pseudotime, Lineage) %>%
+  filter(summary_gates_v4 %in% c("DP2", "CD4+CD8low")) %>%
+  select(response = summary_gates_v4, predictor = mean_pseudotime)
+
+roc2 <- roc(threshold_data, response = response, predictor = predictor, levels = c("DP2", "CD4+CD8low"))
+thresh2 <- coords(roc2, "best", ret = "threshold", best.method = "youden")[[1]]
+
+# Threshold leaving CD4+CD8low is nearly identical between the two lineages (9.3), so draw a single threshold instead of two
+threshold_data <- denoised_facs_combined %>%
+  select(summary_gates_v4, mean_pseudotime, Lineage) %>%
+  filter(summary_gates_v4 %in% c("CD4+CD8low", "SemimatureCD4", "DP3")) %>%
+  mutate(new_gate = case_when(summary_gates_v4 == "CD4+CD8low" ~ "CD4+CD8low",
+                              summary_gates_v4 %in% c("SemimatureCD4", "DP3") ~ "rest")) %>%
+  select(response = new_gate, predictor = mean_pseudotime)
+
+roc3 <- roc(threshold_data, response = response, predictor = predictor, levels = c("CD4+CD8low", "rest"))
+thresh3 <- coords(roc3, "best", ret = "threshold", best.method = "youden")[[1]]
+
+# DP3 to SemimatureCD8
+threshold_data <- denoised_facs_combined %>%
+  select(summary_gates_v4, mean_pseudotime, Lineage) %>%
+  filter(summary_gates_v4 %in% c("DP3", "SemimatureCD8")) %>%
+  select(response = summary_gates_v4, predictor = mean_pseudotime)
+
+roc5 <- roc(threshold_data, response = response, predictor = predictor, levels = c("DP3", "SemimatureCD8"))
+thresh5 <- coords(roc5, "best", ret = "threshold", best.method = "youden")[[1]]
+
+# Semimature to Mature
+threshold_data <- denoised_facs_combined %>%
+  select(summary_gates_v4, mean_pseudotime, Lineage) %>%
+  filter(summary_gates_v4 %in% c("SemimatureCD4", "MatureCD4", "SemimatureCD8", "MatureCD8")) %>%
+  mutate(new_gate = case_when(summary_gates_v4 %in% c("SemimatureCD4", "SemimatureCD8") ~ "Semimature",
+                              summary_gates_v4 %in% c("MatureCD4", "MatureCD8") ~ "Mature")) %>%
+  select(response = new_gate, predictor = mean_pseudotime)
+
+roc4 <- roc(threshold_data, response = response, predictor = predictor, levels = c("Semimature", "Mature"))
+thresh4 <- coords(roc4, "best", ret = "threshold", best.method = "youden")[[1]]
+```
+
+```{r Plot timeline histograms}
+lineage_labels <- c("MHCII-specific", "MHCI-specific")
+names(lineage_labels) <- c("CD4", "CD8")
+
+gate_colors <- c("#D783FF", "#942193", "#FF8AD8", "#7A81FF",
+                 "#FF2F92", "#0096FF",
+                 "#941751", "#005493")
+names(gate_colors) <- c("DP1", "DP2", "CD4+CD8low", "DP3", "SemimatureCD4", "SemimatureCD8", "MatureCD4", "MatureCD8")
+
+# CD8
+ggplot(denoised_facs_combined %>% filter(!(is.na(summary_gates_v4)), Lineage %in% c("CD8"), summary_gates_v4 %in% c("DP1", "DP2", "CD4+CD8low", "DP3", "SemimatureCD8", "MatureCD8")), aes(x = mean_pseudotime, after_stat(density), fill = summary_gates_v4)) +
+  geom_histogram(bins = 50, alpha = 0.5, position = "identity") +
+  labs(x = "Pseudotime", y = "Density", fill = "Gate") +
+  scale_fill_manual(values = gate_colors[c(1,2,3,4,6,8)]) +
+  theme_classic() +
+  facet_wrap(vars(Lineage), ncol = 3, labeller = labeller(Lineage = lineage_labels)) +
+  geom_vline(xintercept = thresh1) +
+  geom_vline(xintercept = thresh2) +
+  geom_vline(xintercept = thresh3) +
+  geom_vline(xintercept = thresh4) +
+  geom_vline(xintercept = thresh5) +
+  theme(legend.position = "none") +
+  xlim(-0.2,16.3)
+ggsave("figures/timeline_CD8gates.png", dpi = 1000, bg = "transparent", height = 1.5, width = 7.5)
+
+# CD4
+ggplot(denoised_facs_combined %>% filter(!(is.na(summary_gates_v4)), Lineage %in% c("CD4"), summary_gates_v4 %in% c("DP1", "DP2", "CD4+CD8low", "SemimatureCD4", "MatureCD4")), aes(x = mean_pseudotime, after_stat(density), fill = summary_gates_v4)) +
+  geom_histogram(bins = 50, alpha = 0.5, position = "identity") +
+  labs(x = "Pseudotime", y = "Density", fill = "Gate") +
+  theme_classic() +
+  scale_fill_manual(values = gate_colors[c(1,2,3,5,7)]) +
+  facet_wrap(vars(Lineage), ncol = 3, labeller = labeller(Lineage = lineage_labels)) +
+  geom_vline(xintercept = thresh1) +
+  geom_vline(xintercept = thresh2) +
+  geom_vline(xintercept = thresh3) +
+  geom_vline(xintercept = thresh4) +
+  theme(legend.position = "none") +
+  xlim(-0.2,16.3)
+ggsave("figures/timeline_CD4gates.png", dpi = 1000, bg = "transparent", height = 1.5, width = 7.5)
+```
+
+```{r Use thresholds to make schematic gate timeline large}
+schematic_timeline <- tibble(Pseudotime = c(thresh1, thresh2 - thresh1, thresh3 - thresh2, thresh4-thresh3, 16-thresh4, thresh1, thresh2-thresh1, thresh3-thresh2, thresh5-thresh3, thresh4-thresh5, 16-thresh4), 
+                             Gate = factor(c("DP1", "DP2", "CD4+CD8low", "SemimatureCD4", "MatureCD4", "DP1", "DP2", "CD4+CD8low", "DP3", "SemimatureCD8", "MatureCD8"), levels = c("DP1", "DP2", "CD4+CD8low", "DP3", "SemimatureCD4", "SemimatureCD8", "MatureCD4", "MatureCD8")), 
+                             Lineage = c(rep("CD4", 5), rep("CD8", 6)))
+```
+
+```{r Skinny schematic}
+schematic_timeline$Lineage <- factor(schematic_timeline$Lineage, levels = c("CD8", "CD4"))
+schematic_timeline <- schematic_timeline %>%
+  mutate(Gate_short = recode(Gate, SemimatureCD4 = "SM CD4",
+                             SemimatureCD8 = "SM CD8"))
+
+# With text
+ggplot(schematic_timeline, aes(fill = Gate, x = Pseudotime, y = Lineage)) +
+  geom_bar(position = position_stack(reverse = TRUE), stat = "identity", width = .9, color = "white") +
+  theme_classic() +
+  geom_text(aes(label = Gate_short), position = position_stack(reverse = TRUE, vjust = .5), angle = 0) +
+  scale_fill_manual(values = gate_colors) +
+  theme(legend.position = "none", aspect.ratio = 1/10)
+ggsave("figures/timeline_schematic.png", dpi = 1000, bg = "transparent", height = 2, width = 7)
+```
+
+```{r Schematic timeline no text}
+ggplot(schematic_timeline, aes(fill = Gate, x = Pseudotime, y = Lineage)) +
+  geom_bar(position = position_stack(reverse = TRUE), stat = "identity", width = .9, color = "white") +
+  theme_classic() +
+  scale_fill_manual(values = gate_colors) +
+  guides(fill = guide_legend(ncol = 2)) +
+  theme(legend.position = "right", aspect.ratio = 1/10)
+ggsave("figures/timeline_schematic_notext.pdf", dpi = 1000, bg = "transparent", height = 3.5, width = 7)
+```
+
+## FACS plots using gates
+### Zbtb7b vs Runx3
+
+```{r Zbtb7b vs Runx3 by lineage colored by time}
+ggplot(denoised_facs_combined, aes(Runx3_log, Zbtb7b_log, color = mean_pseudotime)) +
+  geom_point(size = .6, stroke = 0) +
+  theme_light() +
+  scale_color_gradientn(colors = colorRampPalette(brewer.pal(11,'Spectral')[-6])(100)) +
+  labs(color = "Pseudotime", x = "log(Runx3)", y = "log(Zbtb7b)") +
+  facet_wrap(vars(Lineage), nrow = 1) +
+  theme(strip.text.y.left = element_text(angle = 0)) +
+  coord_equal() +
+  geom_vline(xintercept = (-8.3))+
+  geom_hline(yintercept = (-10))
+
+ggsave("figures/FACS_Runx3_Zbtb7b_facet_lineage_colorpseudotime.png", dpi = 1000, bg = "transparent", height = 3, width = 5)
+```
+
+```{r Zbtb7b vs Runx3 by time bins}
+denoised_facs_combined <- denoised_facs_combined %>%
+  mutate(Bin_ranges = recode(Pseudotime_bin, `0` = "0-2",
+                             `1` = "2-4",
+                             `2` = "4-6",
+                             `3` = "6-8",
+                             `4` = "8-10",
+                             `5` = "10-12",
+                             `6` = "12-14",
+                             `7` = "14-16"))
+
+ggplot(denoised_facs_combined %>% filter(!(is.na(summary_gates_v4))), aes(Runx3_log, Zbtb7b_log, color = mean_pseudotime)) +
+  geom_point(size = .5, stroke = 0) +
+  theme_light() +
+  scale_color_gradientn(colors = colorRampPalette(brewer.pal(11,'Spectral')[-6])(100)) +
+  labs(color = "Pseudotime", x = "log(Runx3)", y = "log(Zbtb7b)") +
+  facet_grid(cols = vars(Bin_ranges), rows = vars(Lineage)) + 
+  geom_vline(xintercept = (-8.3))+
+  geom_hline(yintercept = (-10)) +
+  coord_equal()
+
+ggsave("figures/FACS_Runx3_Zbtb7b_facet_time_lineage_colorpseudotime.png", dpi = 1000, bg = "transparent", height = 4.5, width = 7.5)
+ggsave("figures/FACS_Runx3_Zbtb7b_facet_time_lineage_colorpseudotime.pdf", height = 4.5, width = 7.5, bg = "transparent")
+```
+
+### CD4 vs CD8
+
+```{r All cells FACS CD4 CD8}
+ggplot(denoised_facs_combined, aes(CD8a, CD4, color = mean_pseudotime)) +
+  geom_point(size = 1, stroke = 0) +
+  theme_classic() +
+  scale_color_gradientn(colors = colorRampPalette(brewer.pal(11,'Spectral')[-6])(100)) +
+  labs(x = "CD8a", y = "CD4", color = "Pseudotime") +
+  coord_equal() +
+  geom_vline(xintercept = 4.4, color = "black") + 
+  geom_hline(yintercept = 4.4, color = "black") +
+  geom_segment(x = 2.6, y = 4.4, xend = 2.6, yend = 7, color = "black", size = .3) +
+  geom_segment(x = 4.4, y = 2.6, xend = 7, yend = 2.6, color = "black", size = .3, linetype = "dashed") +
+  geom_density_2d(aes(CD8a, CD4), color = "black", bins = 20, size = .3)
+
+ggsave("figures/FACS_CD4_CD8_time.png", dpi = 1000, bg = "transparent", height = 4.5, width = 4.5)
+```
+
+```{r Facet by lineage CD4 CD8}
+ggplot(denoised_facs_combined, aes(CD8a, CD4, color = mean_pseudotime)) +
+  geom_point(size = .5, stroke = 0) +
+  theme_classic() +
+  scale_color_gradientn(colors = colorRampPalette(brewer.pal(11,'Spectral')[-6])(100)) +
+  labs(x = "CD8a", y = "CD4", color = "Pseudotime") +
+  facet_wrap("Lineage", ncol = 1) +
+  coord_equal() +
+  geom_vline(xintercept = 4.4, color = "black") + 
+  geom_hline(yintercept = 4.4, color = "black") +
+  geom_segment(x = 2.6, y = 4.4, xend = 2.6, yend = 7, color = "black", size = .2) +
+  geom_segment(x = 4.4, y = 2.6, xend = 7, yend = 2.6, color = "black", size = .2, linetype = "dashed")
+
+ggsave("figures/FACS_CD4_CD8_time_facet_lineage.png", dpi = 1000, bg = "transparent", height = 3.5, width = 3.5)
+```
+```{r Facet by time and lineage CD4 CD8}
+ggplot(denoised_facs_combined, aes(CD8a, CD4, color = mean_pseudotime)) +
+  geom_point(size = .5, stroke = 0) + 
+  theme_light() +
+  scale_color_gradientn(colors = colorRampPalette(brewer.pal(11,'Spectral')[-6])(100)) +
+  labs(color = "Pseudotime") +
+  facet_grid(cols = vars(Bin_ranges), rows = vars(Lineage)) +
+  coord_equal() +
+  geom_vline(xintercept = 4.4, color = "black") + 
+  geom_hline(yintercept = 4.4, color = "black") +
+  geom_segment(x = 2.6, y = 4.4, xend = 2.6, yend = 7, color = "black", size = .2) +
+  geom_segment(x = 4.4, y = 2.6, xend = 7, yend = 2.6, color = "black", size = .2, linetype = "dashed")
+
+ggsave("figures/FACS_CD4_CD8_facet_time_lineage.png", dpi = 1000, height = 4.5, width = 7.5, bg = "transparent")
+ggsave("figures/FACS_CD4_CD8_facet_time_lineage.pdf", height = 4.5, width = 7.5, bg = "transparent")
+```
+
+### CD69 vs CD127
+```{r Plot all cells CD69 CD127}
+ggplot(denoised_facs_combined, aes(`CD127(IL-7Ra)`, CD69, color = mean_pseudotime)) + 
+  geom_point(size = 1, stroke = 0) +
+  theme_classic() +
+  scale_color_gradientn(colors = colorRampPalette(brewer.pal(11,'Spectral')[-6])(100)) +
+  labs(color = "Pseudotime") +
+  coord_equal() +
+  geom_hline(yintercept = 2.55) +
+  geom_vline(xintercept = 0.9) +
+  geom_density_2d(color = "black", bins = 20, size = 0.3)
+
+ggsave("figures/FACS_CD69_CD127_time.png", dpi = 1000, bg = "transparent", height = 4.5, width = 4.5)
+```
+```{r Facet by lineage CD69 CD127}
+ggplot(denoised_facs_combined, aes(`CD127(IL-7Ra)`, CD69, color = mean_pseudotime)) +
+  geom_point(size = .5, stroke = 0) +
+  theme_classic() +
+  scale_color_gradientn(colors = colorRampPalette(brewer.pal(11,'Spectral')[-6])(100)) +
+  labs(color = "Pseudotime") +
+  facet_wrap("Lineage", ncol = 1) +
+  coord_equal() +
+  geom_hline(yintercept = 2.55) +
+  geom_vline(xintercept = 0.9)
+
+ggsave("figures/FACS_CD69_CD127_time_facet_lineage.png", dpi = 1000, bg = "transparent", height = 4, width = 4)
+```
+
+```{r CD69 CD127 by time and lineage}
+ggplot(denoised_facs_combined, aes(`CD127(IL-7Ra)`, CD69, color = mean_pseudotime)) + 
+  geom_point(size = .5, stroke = 0) + 
+  theme_light() +
+  scale_color_gradientn(colors = colorRampPalette(brewer.pal(11,'Spectral')[-6])(100)) +
+  labs(color = "Pseudotime") +
+  facet_grid(cols = vars(Bin_ranges), rows = vars(Lineage)) +
+  coord_equal() +
+  geom_hline(yintercept = 2.55) +
+  geom_vline(xintercept = 0.9)
+
+ggsave("figures/FACS_CD69_CD127_facet_time_lineage.png", dpi = 1000, height = 4.5, width = 7.5, bg = "transparent")
+ggsave("figures/FACS_CD69_CD127_facet_time_lineage.pdf", height = 4.5, width = 7.5, bg = "transparent")
+```
+
+### CD5 vs TCRb
+```{r Plot DP cells CD5 TCRb}
+ggplot(denoised_facs_combined %>% filter(CD4_CD8_gate == "DP"), aes(`TCRbchain`, CD5, color = mean_pseudotime)) + 
+  geom_point(size = 1, stroke = 0) +
+  theme_classic() +
+  scale_color_gradientn(colors = colorRampPalette(brewer.pal(11,'Spectral')[-6])(100)) +
+  labs(color = "Pseudotime") +
+  coord_equal() +
+  geom_density_2d(color = "black", bins = 20, size = 0.3) +
+  geom_vline(xintercept = 3.8)
+
+ggsave("figures/FACS_TCRb_CD5_time.png", dpi = 1000, bg = "transparent", height = 4.5, width = 4.5)
+```
+```{r DP cells plot by lineage CD5 TCRb}
+ggplot(denoised_facs_combined%>% filter(CD4_CD8_gate == "DP"), aes(`TCRbchain`, CD5, color = mean_pseudotime)) +
+  geom_point(size = .5, stroke = 0) +
+  theme_classic() +
+  scale_color_gradientn(colors = colorRampPalette(brewer.pal(11,'Spectral')[-6])(100)) +
+  labs(color = "Pseudotime") +
+  facet_wrap("Lineage", ncol = 1) +
+  coord_equal() +
+  geom_vline(xintercept = 3.8)
+
+ggsave("figures/FACS_TCRb_CD5_time_facet_lineage.png", dpi = 1000, bg = "transparent", height = 3.5, width = 3.5)
+```
+
+## Gates on UMAP
+
+```{r Plot CITE-seq gates on UMAP}
+gate_colors <- c("#D783FF", "#942193", "#FF8AD8", "#7A81FF",
+                 "#FF2F92", "#0096FF",
+                 "#941751", "#005493")
+names(gate_colors) <- c("DP1", "DP2", "CD4+CD8low", "DP3", "SemimatureCD4", "SemimatureCD8", "MatureCD4", "MatureCD8")
+
+ggplot(denoised_facs_combined %>% filter(!(is.na(summary_gates_v4))), mapping = aes(x = UMAP1, y = UMAP2, color = summary_gates_v4)) +
+  theme_classic() +
+  scale_color_manual(values = gate_colors) +
+  geom_point(stroke  = 0, size = .3) +
+  coord_fixed(ratio = 1) +
+  labs(color = "Gate") +
+  guides(colour = guide_legend(override.aes = list(size=2)))
+ggsave("figures/umap_gated.png", dpi = 1000, bg = "transparent", height = 3, width = 6)
+```
+
+
+
+## Save FACS gated data
+
+```{r Write denoised FACS data}
+# write_csv(denoised_facs_combined, "gated_denoised_data_20210330.csv")
+# denoised_facs_combined <- read_csv("gated_denoised_data_20210330.csv")
+```
+
+# Plot pseudotime on UMAP with Slingshot results
+
+```{r Cells per lineage by genotype}
+# Tabulate cells per lineage (including wrong lineage cells) by genotype
+wronglin_pct <- table(pseudotime_data$Genotype, pseudotime_data$Lineage_by_genotypeSlingshot, useNA = "ifany")
+colnames(wronglin_pct)[3] <- "Wrong_Lineage"
+names(dimnames(wronglin_pct)) <- c("Genotype", "Lineage")
+
+wronglin_pct <- as_tibble(wronglin_pct) %>%
+  pivot_wider(names_from = "Lineage", values_from = n) %>%
+  rowwise() %>%
+  mutate(Wrong_pct = Wrong_Lineage/(CD4 + CD8 + Wrong_Lineage))
+wronglin_pct # Note WT cells are unassigned, so they are included in the "wrong lineage" column here
+write_csv(wronglin_pct, "Lineage_by_genotype.csv")
+```
+
+
+```{r Load Slingshot results}
+# Needed to plot curves in pseudotime
+crv <- readRDS("slingshot_20200913_removeCD8outlier.rds")
+
+slingshot_curve1 <- as_tibble(slingCurves(crv)[[1]]$s[slingCurves(crv)[[1]]$ord, ])
+slingshot_curve2 <- as_tibble(slingCurves(crv)[[2]]$s[slingCurves(crv)[[2]]$ord, ])
+```
+
+```{r Plot pseudotime}
+ggplot() +
+  theme_classic() +
+  geom_point(time_bins, mapping = aes(x = UMAP1, y = UMAP2, color = mean_pseudotime), stroke  = 0, size = .2) +
+  scale_color_gradientn(colors = colorRampPalette(brewer.pal(11,'Spectral')[-6])(100)) +
+  coord_fixed(ratio = 1) +
+  geom_path(slingshot_curve1, mapping = aes(x = UMAP1, y = UMAP2), size = 0.3) +
+  geom_path(slingshot_curve2, mapping = aes(x = UMAP1, y = UMAP2), size = 0.3) +
+  labs(color = "Pseudotime") +
+  theme(legend.position = "bottom")
+
+ggsave("figures/umap_pseudotime_curves.pdf", bg = "transparent", height = 3, width = 5)
+```
+
+```{r Plot time bins on UMAP}
+ggplot() +
+  theme_classic() +
+  geom_point(denoised_facs_combined, mapping = aes(x = UMAP1, y = UMAP2, color = Bin_ranges), stroke  = 0, size = .3) +
+  scale_color_brewer(palette = "Spectral") +
+  coord_fixed(ratio = 1) +
+  labs(color = "Pseudotime") +
+  guides(colour = guide_legend(override.aes = list(size=2))) +
+  theme(legend.position = "bottom")
+
+ggsave("figures/umap_pseudotime_binned.png", dpi = 1000, bg = "transparent", height = 4, width = 4) 
+```
+
+# Comparison of population frequencies in CITE-seq vs flow
+
+```{r Find WT proportions in CITE-seq data per mouse}
+denoised_facs_WT <- denoised_facs_combined %>%
+  filter(Lineage == "WT")
+
+# 8 gated populations from summary gates v4
+CITEseq_proportions <- as_tibble(as.data.frame.matrix(table(denoised_facs_WT$summary_gates_v4, denoised_facs_WT$Mouse)),
+                                 rownames = "Gate") %>%
+  mutate(across(B6_r1:B6_r5, ~.x/sum(.x)))
+
+CITEseq_proportions$Gate <- factor(CITEseq_proportions$Gate, levels = c("DP1", "DP2", "CD4+CD8low", "DP3", "SemimatureCD4", "SemimatureCD8",
+                                                                        "MatureCD4", "MatureCD8"))
+
+proportions <- CITEseq_proportions %>%
+  pivot_longer(cols = B6_r1:B6_r5, names_to = "Mouse", values_to = "Frequency") %>%
+  group_by(Gate) %>%
+  summarize(n = n(),
+            mean = mean(Frequency),
+            sd = sd(Frequency)    ) %>%
+  mutate(se = sd/sqrt(n)) %>%
+  mutate(Data = "CITE-seq")
+```
+
+```{r Add proportions from flow}
+flow_proportions <- read_csv("Flow_adultWTthymiccellproportions.csv") %>%
+  select(Gate:M5, M8:M9) # exclude M6 and M7, which were missing the gate on CD5 (all others gated with TCRb vs CD5 gate for positive selection)
+
+flow_proportions$Gate <- factor(flow_proportions$Gate, levels = c("DP1", "DP2", "CD4+CD8low", "DP3", "SemimatureCD4", "SemimatureCD8",
+                                                                        "MatureCD4", "MatureCD8"))
+
+proportions_flow <- flow_proportions %>%
+  pivot_longer(cols = M1:M9, names_to = "Mouse", values_to = "Frequency") %>%
+  group_by(Gate) %>%
+  summarize(n = n(),
+            mean = mean(Frequency),
+            sd = sd(Frequency),
+            ) %>%
+  mutate(se = sd/sqrt(n)) %>%
+  mutate(Data = "Flow cytometry")
+
+proportions_all <- proportions %>%
+  bind_rows(proportions_flow)
+```
+
+```{r Plot all proportions}
+ggplot(proportions_all, aes(fill = Data)) +
+  geom_col(aes(x = Gate, y = mean, fill = Data), position = position_dodge(width = 0.9)) +
+  geom_errorbar(aes(x = Gate, ymin = mean - sd, ymax = mean + sd), width = 0.25, alpha = 0.5, position = position_dodge(width = 0.9)) +
+  scale_fill_manual(values = c("cyan3", "blueviolet")) +
+  scale_x_discrete(labels=c("DP1", "DP2", "CD4+CD8low", "DP3", "CD4+SM", "CD8+SM", "CD4+Mat", "CD8+Mat")) +
+  theme_classic() +
+  theme(legend.position = c(0.8, 0.8), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  labs(y = "Frequency")
+
+ggsave("figures/cell_type_proportions.pdf", bg = "transparent", height = 3.5*.95, width = 5*.95)
+```
+
+```{r Plot all proportions with replicates overlaid as points}
+proportions_permouse_CITEseq <- CITEseq_proportions %>% pivot_longer(cols = B6_r1:B6_r5, names_to = "Mouse", values_to = "Frequency") %>% mutate(Data = "CITE-seq")
+proportions_permouse_flow <- flow_proportions %>% pivot_longer(cols = M1:M9, names_to = "Mouse", values_to = "Frequency") %>% mutate(Data = "Flow cytometry")
+proportions_permouse <- rbind(proportions_permouse_CITEseq, proportions_permouse_flow)
+
+ggplot() +
+  geom_col(data = proportions_all, mapping = aes(x = Gate, y = mean, fill = Data), position = position_dodge(width = 0.9)) +
+  geom_point(proportions_permouse, mapping = aes(x = Gate, y = Frequency, group = Data), position = position_dodge(width = 0.9)) +
+  geom_errorbar(data = proportions_all, mapping = aes(x = Gate, ymin = mean - sd, ymax = mean + sd, group = Data),
+                width = 0.25, alpha = 0.5, position = position_dodge(width = 0.9)) +
+  scale_fill_manual(values = c("cyan3", "blueviolet")) +
+  scale_x_discrete(labels=c("DP1", "DP2", "CD4+CD8low", "DP3", "CD4+SM", "CD8+SM", "CD4+Mat", "CD8+Mat")) +
+  theme_classic() +
+  theme(legend.position = c(0.8, 0.8), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  labs(y = "Frequency")
+
+ggsave("figures/cell_type_proportions.pdf", bg = "transparent", height = 3.5*.95, width = 5*.95)
+```

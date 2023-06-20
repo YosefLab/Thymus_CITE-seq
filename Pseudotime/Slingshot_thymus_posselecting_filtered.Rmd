@@ -1,0 +1,854 @@
+---
+title: "Slingshot on CD4/CD8 lineages in the thymus"
+output: html_notebook
+---
+
+Zoë Steier
+
+* Slingshot to find pseudotime ordering of CD4/CD8 lineages.
+* Plot expression over pseudotime as heatmaps.
+
+# Load packages
+
+```{r Load packages}
+library(tidyverse)
+library(slingshot)
+library(pals)
+library(RColorBrewer)
+library(DescTools)
+library(pheatmap)
+
+packageVersion("pals")
+packageVersion("DescTools")
+packageVersion("pheatmap")
+```
+
+# Load data
+## Load totalVI data
+
+```{r Load totalVI data}
+totalvi_path <- "/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/totalVI_thymus/thymus111_allbatches_stable_posselecting/totalVI_results/"
+
+latent <- read_csv(gzfile(str_c(totalvi_path, "latent.csv.gz")))
+umap_totalVI <- read_csv(gzfile(str_c(totalvi_path, "umap.csv.gz")))
+denoised_proteins <- read_csv(gzfile(str_c(totalvi_path, "denoised_proteins.csv.gz")))
+denoised_genes <- read_csv(gzfile(str_c(totalvi_path, "denoised_genes.csv.gz")))
+totalVI_genes <- read_csv(gzfile(str_c(totalvi_path, "totalVI_genes.csv.gz")))
+totalVI_proteins <- read_csv(gzfile(str_c(totalvi_path, "totalVI_proteins.csv.gz")))
+obs <- read_csv(gzfile(str_c(totalvi_path, "obs.csv.gz")))
+
+meta_csv <- read_csv("/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/metadata/Metadata_SeqStats_totalSeq_experiments.csv")
+meta_thymus <- meta_csv %>%
+  filter(Tissue == "thymus") %>%
+  filter(TotalSeq_panel == "ADT111") # 19 batches in total
+meta_thymus <- meta_thymus %>%
+  mutate(Batch = seq(1, dim(meta_thymus)[1]) - 1) # rename batches starting at 0
+```
+
+```{r Load filtered data}
+filt_path <- "/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/Annotation_thymus/"
+obs_filtered <- read_csv(gzfile(str_c(filt_path, "adata_positiveselection_filt_obs.csv.gz")))
+filtered_cells <- obs_filtered$X1
+```
+
+## Extract totalVI data
+
+```{r Parse totalVI data}
+# Extract: clusters, umap, denoised proteins, latent, etc.
+# Remove first column of dataframes - this is an index column coming from python
+
+# totalVI umap
+totalvi_umap <- as.data.frame(umap_totalVI[, -1])
+colnames(totalvi_umap) <- c("UMAP1", "UMAP2")
+row.names(totalvi_umap) <- obs$X1
+
+# totalVI latent space
+totalvi_latent <- as.matrix(latent[, -1])
+row.names(totalvi_latent) <- obs$X1
+
+# totalVI denoised proteins
+denoised_proteins <- denoised_proteins %>%
+  select(-c(X1))
+colnames(denoised_proteins) <- totalVI_proteins[, 2][[1]]
+denoised_proteins <- denoised_proteins %>%
+  mutate(Barcode = obs$X1)
+
+# totalVI denoised genes
+denoised_genes <- denoised_genes %>%
+  select(-c(X1))
+colnames(denoised_genes) <- totalVI_genes[, 2][[1]]
+denoised_genes <- denoised_genes %>%
+  mutate(Barcode = obs$X1)
+```
+
+```{r Make metadata from totalVI}
+# totalVI Leiden clusters and metadata
+totalVI_meta <- obs %>%
+  select(Batch = 'batch_indices', UMIs_RNA = "n_counts", UMIs_protein = "n_protein_counts",
+          'n_genes', 'n_proteins', 'percent_mito', contains("leiden_totalVI_"), Barcode = "X1") %>%
+  mutate_at(vars(contains("leiden_totalVI_")), as_factor) %>% # Convert cluster labels to factors
+  left_join(meta_thymus %>% select(Sample, Genotype, Experiment, Replicate, Location, Batch), by = "Batch") %>% # Join with experimental metadata
+  mutate(Mouse = str_c(Genotype, "_", Replicate)) %>% # Add mouse information
+  mutate_at(c("Sample", "Batch", "Mouse", "Experiment", "Genotype", "Location"), as_factor) %>% # Set as factors to preserve the order of levels
+  select(-"Replicate")
+```
+
+# Run Slingshot
+## Prepare data for slingshot
+
+```{r View clusters on UMAP}
+set.seed(200)
+
+# Plot clusters
+totalVI_clusters <- as_tibble(cbind(totalVI_meta, as_tibble(totalvi_umap))) 
+
+ggplot(data = totalVI_clusters, aes(x = UMAP1, y = UMAP2, color = leiden_totalVI_res0.6)) +
+  geom_point(size = 0.75, stroke = 0) + 
+  theme_classic() +
+  scale_color_manual(values = c(brewer.paired(10))) +
+  labs(color = "Cluster", title = "leiden_totalVI_res0.6") + 
+  guides(colour = guide_legend(override.aes = list(size=2)))
+```
+
+```{r Filter cells by subsetting}
+# Use previously filtered data to apply the above filters (additionally removing the CD8 early outliers)
+totalVI_clusters_filt <- totalVI_clusters %>%
+  filter(Barcode %in% filtered_cells) %>%
+  mutate(slingshot_clusters = str_replace(leiden_totalVI_res0.6, "7", "1"))
+
+ggplot(data = totalVI_clusters_filt, aes(x = UMAP1, y = UMAP2, color = slingshot_clusters)) +
+  geom_point(size = .75, stroke = 0) +
+  theme_classic() +
+  scale_color_manual(values = c(brewer.paired(10))) +
+  labs(color = "Cluster", title = "slingshot_clusters") + 
+  guides(colour = guide_legend(override.aes = list(size=2)))
+```
+
+## Run slingshot
+
+```{r Run slingshot}
+# First check lineages to see if parameters need to be changed. Then run getCurves only once because it is slower.
+lin <- getLineages(
+  totalVI_clusters_filt[, c("UMAP1", "UMAP2")],
+  totalVI_clusters_filt$slingshot_clusters,
+  start.clus = "1",
+  end.clus = c("0", "3")
+  )
+crv <- getCurves(lin, approx_points = 200)
+```
+
+```{r View lin results}
+lin
+```
+
+```{r View crv results}
+crv
+```
+
+```{r Plot slingshot lineages}
+plot(totalVI_clusters_filt[, c("UMAP1", "UMAP2")], pch=16, cex = 0.25, col = brewer.paired(11)[as.factor(totalVI_clusters_filt$slingshot_clusters)]) 
+lines(lin, lwd=2, type = 'lineages', show.constraints = TRUE, color = "black")
+```
+
+```{r Plot slingshot curves}
+plot(reducedDims(crv)[,1:2], pch=16, cex = 0.25, col = brewer.paired(11)[as.factor(totalVI_clusters_filt$slingshot_clusters)]) 
+lines(crv, lwd=2, col = "black")
+```
+
+```{r Save slingshot output}
+getwd() #"/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/Slingshot_thymus"
+saveRDS(crv, "slingshot_20200913_removeCD8outlier.rds")
+
+# Load saved object
+crv <- readRDS("slingshot_20200913_removeCD8outlier.rds")
+```
+
+## Plot slingshot results
+
+```{r Data for plotting with ggplot}
+pseudotime <- as_tibble(slingPseudotime(crv)) %>%
+  mutate(difference = abs(curve1 - curve2)) 
+pseudotime <- pseudotime %>%
+  mutate(mean_pseudotime = rowMeans(select(pseudotime, c(curve1, curve2)), na.rm = TRUE)) %>%
+  mutate(UMAP1 = reducedDims(crv)[,1]) %>%
+  mutate(UMAP2 = reducedDims(crv)[,2])
+
+# Slingshot curves for plotting
+slingshot_curve1 <- as_tibble(slingCurves(crv)[[1]]$s[slingCurves(crv)[[1]]$ord, ]) 
+slingshot_curve2 <- as_tibble(slingCurves(crv)[[2]]$s[slingCurves(crv)[[2]]$ord, ]) 
+```
+
+```{r Plot pseudotime ggplot}
+ggplot() +
+  theme_classic() +
+  geom_point(pseudotime, mapping = aes(x = UMAP1, y = UMAP2, color = mean_pseudotime), stroke  = 0, size = .8) +
+  scale_color_gradientn(colors = colorRampPalette(brewer.pal(11,'Spectral')[-6])(100)) + 
+  coord_fixed(ratio = 1) +
+  geom_path(slingshot_curve1, mapping = aes(x = UMAP1, y = UMAP2)) +
+  geom_path(slingshot_curve2, mapping = aes(x = UMAP1, y = UMAP2)) +
+  labs(color = "Pseudotime")
+```
+
+```{r Plot each lineage by pseudotime}
+ggplot() +
+  geom_point(pseudotime, mapping = aes(x = UMAP1, y = UMAP2), color = "grey75", stroke  = 0, size = .8) + 
+  theme_classic() +
+  geom_point(pseudotime, mapping = aes(x = UMAP1, y = UMAP2, color = curve1), stroke  = 0, size = .8) +
+  scale_color_gradientn(colors = brewer.spectral(100)) +
+  coord_fixed(ratio = 1) +
+  labs(color = "Pseudotime")
+
+ggplot() +
+  geom_point(pseudotime, mapping = aes(x = UMAP1, y = UMAP2), color = "grey75", stroke  = 0, size = .8) +
+  theme_classic() +
+  geom_point(pseudotime, mapping = aes(x = UMAP1, y = UMAP2, color = curve2), stroke  = 0, size = .8) +
+  scale_color_gradientn(colors = brewer.spectral(100)) +
+  coord_fixed(ratio = 1) +
+  labs(color = "Pseudotime")
+```
+
+```{r Plot lineage weights}
+# Add lineage weights to pseudotime tibble
+pseudotime <- pseudotime %>%
+  mutate(weight_curve1 = slingCurveWeights(crv)[,1]) %>%
+  mutate(weight_curve2 = slingCurveWeights(crv)[,2])
+pseudotime_data <- as_tibble(cbind(pseudotime, totalVI_clusters_filt %>% select(-c("UMAP1", "UMAP2"))))
+
+ggplot() +
+  geom_point(pseudotime, mapping = aes(x = UMAP1, y = UMAP2), color = "grey75", stroke  = 0, size = .8) + 
+  theme_classic() +
+  geom_point(pseudotime, mapping = aes(x = UMAP1, y = UMAP2, color = weight_curve1), stroke  = 0, size = .8) +
+  scale_color_gradientn(colors = brewer.spectral(100)) +
+  coord_fixed(ratio = 1) +
+  labs(color = "Lineage1 Weight")
+
+ggplot() +
+  geom_point(pseudotime, mapping = aes(x = UMAP1, y = UMAP2), color = "grey75", stroke  = 0, size = .8) + 
+  theme_classic() +
+  geom_point(pseudotime, mapping = aes(x = UMAP1, y = UMAP2, color = weight_curve2), stroke  = 0, size = .8) +
+  scale_color_gradientn(colors = brewer.spectral(100)) +
+  coord_fixed(ratio = 1) +
+  labs(color = "Lineage2 Weight")
+
+# Lineage 1 is CD4, Lineage 2 is CD8
+```
+
+## Assign cells to a lineage
+
+```{r Assign cells to a lineage}
+# First, assign cells to known lineage by genotype (WT is unknown)
+# Then, exclude cells with < 0.5 weight in the intended lineage (these are likely a small percentage of cells going down the wrong lineage)
+pseudotime_data_lineage <- pseudotime_data %>%
+  mutate(Lineage_by_genotype = recode(as.character(Genotype), B6 = "NA", # Note that NA must be a character here for recode to work
+                                      AND = "CD4",
+                                      F5 = "CD8",
+                                      OT1 = "CD8",
+                                      OT2 = "CD4",
+                                      B2M = "CD4",
+                                      MHC2 = "CD8"
+                                      )) %>%
+  mutate(Lineage_by_genotypeSlingshot = case_when( # Excluding some cells in wrong lineage by Slingshot weights, NA for unassigned cells
+    ((Lineage_by_genotype == "CD4") & (weight_curve1 > 0.5)) ~ "CD4", # CD4 when genotype is CD4, lin1 weight > 0.5
+    ((Lineage_by_genotype == "CD8") & (weight_curve2 > 0.5)) ~ "CD8")) %>%  # CD8 when genotype is CD8, lin2 weight > 0.5
+  mutate(LinWeight_CD4 = recode(Lineage_by_genotypeSlingshot, "CD4" = 1, "CD8" = 0)) %>% # Alternative weights: 0, 1, NA for each lineage
+  mutate(LinWeight_CD8 = recode(Lineage_by_genotypeSlingshot, "CD4" = 0, "CD8" = 1))
+  
+pseudotime_data_lineage
+```
+
+```{r Plot new lineages}
+# Select new lineage assigned cells and plot by genotype
+assigned_cells <- pseudotime_data_lineage %>%
+  filter(!(is.na(Lineage_by_genotypeSlingshot)))
+notassigned <- pseudotime_data_lineage %>% # These are the unassigned cells (wrong lineage) that are not from B6
+  filter(!(Genotype == "B6") & (is.na(Lineage_by_genotypeSlingshot)))
+
+plot_assigned <- ggplot() +
+  geom_point(assigned_cells, mapping = aes(x = UMAP1, y = UMAP2, color = Genotype), stroke  = 0, size = .7) + 
+  theme_classic() +
+  scale_color_manual(values = c(brewer.paired(6))) +
+  coord_fixed(ratio = 1) +
+  labs(color = "Lineage-assigned cells") +
+  guides(colour = guide_legend(override.aes = list(size=2)))
+
+plot_unassigned <- ggplot() +
+  geom_point(assigned_cells, mapping = aes(x = UMAP1, y = UMAP2), color = "grey75", stroke  = 0, size = .7) + 
+  geom_point(notassigned, mapping = aes(x = UMAP1, y = UMAP2, color = Genotype), stroke  = 0, size = .7) + 
+  theme_classic() +
+  scale_color_manual(values = c(brewer.paired(6))) +
+  coord_fixed(ratio = 1) +
+  labs(color = "Unassigned cells") +
+  guides(colour = guide_legend(override.aes = list(size=2))) 
+
+plot_assigned
+plot_unassigned
+
+# Plot colored by lineage assignment
+ggplot() +
+  geom_point(assigned_cells, mapping = aes(x = UMAP1, y = UMAP2, color = Lineage_by_genotypeSlingshot), stroke  = 0, size = .6) +
+  theme_classic() +
+  scale_color_brewer(palette = "Set1") +
+  coord_fixed(ratio = 1) +
+  labs(color = "Lineage assignment") +
+  guides(colour = guide_legend(override.aes = list(size=2))) +
+  facet_grid(rows = vars(Lineage_by_genotypeSlingshot))
+
+ggplot() +
+  geom_point(assigned_cells, mapping = aes(x = UMAP1, y = UMAP2, color = Lineage_by_genotypeSlingshot), stroke  = 0, size = .6) + 
+  theme_classic() +
+  scale_color_brewer(palette = "Set1") +
+  coord_fixed(ratio = 1) +
+  labs(color = "Lineage assignment") +
+  guides(colour = guide_legend(override.aes = list(size=2)))
+```
+
+```{r Find how many cells go to correct/incorrect lineages}
+cell_summary_table <- table(pseudotime_data_lineage$Genotype, pseudotime_data_lineage$Lineage_by_genotypeSlingshot, useNA = "ifany")
+names(dimnames(cell_summary_table)) <- c("Genotype", "Lineage")
+cell_summary <- as_tibble(cell_summary_table) %>%
+  pivot_wider(names_from = "Lineage", values_from = "n") %>%
+  mutate(percent_NA = `NA`/(CD4 + CD8 + `NA`)) %>%
+  mutate(percent_correct =  1 - percent_NA)
+
+table(pseudotime_data$Genotype)
+cell_summary
+```
+
+```{r Save pseudotime data}
+write_csv(pseudotime_data_lineage, "pseudotime_slingshot_2020913.csv")
+
+# When reading this data, must instruct the format for the last 4 columns
+pseudotime_data <- read_csv("pseudotime_slingshot_2020913.csv", col_types = cols(Lineage_by_genotype = col_character(), 
+                                                                                  Lineage_by_genotypeSlingshot = col_character(),
+                                                                                  LinWeight_CD4 = col_integer(),
+                                                                                  LinWeight_CD8 = col_integer()))
+
+# Bin pseudotime data
+time_bins <- pseudotime_data %>%
+  mutate(Pseudotime_bin = cut(mean_pseudotime, breaks = seq(0,16, by = 2), include.lowest = TRUE,
+                              labels = str_c(as.character(seq(0, 7)))))
+# Assign cells > 16 to the last bin
+time_bins[is.na(time_bins$Pseudotime_bin), "Pseudotime_bin"] <- "7" # This is exactly 20 cells
+```
+
+# Plot pseudotime results as heatmaps
+## Plot selected features in heatmap
+
+Steps to generate pseudotime heatmaps:
+1. extract data (genes x cells)
+2. create small bins and average within bin (per row) with summarize_all
+3. cbind CD4 and CD8
+4. normalize per row (z score and winsorize to make heatmap colors visible)
+5. separate CD4 and CD8
+6. take rolling average over bins within lineage to smooth the rows
+6. plot with constant column size so pseudotimes (early) match between lineages
+
+```{r Load binned pseudotime data}
+pseudotime_data <- read_csv("pseudotime_slingshot_2020913.csv", col_types = cols(Lineage_by_genotype = col_character(), 
+                                                                                  Lineage_by_genotypeSlingshot = col_character(),
+                                                                                  LinWeight_CD4 = col_integer(),
+                                                                                  LinWeight_CD8 = col_integer()))
+
+# Get binned pseudotime data
+time_bins <- pseudotime_data %>%
+  mutate(Pseudotime_bin = cut(mean_pseudotime, breaks = seq(0,16, by = 2), include.lowest = TRUE,
+                              labels = str_c(as.character(seq(0, 7)))))
+# Assign cells > 16 to the last bin
+time_bins[is.na(time_bins$Pseudotime_bin), "Pseudotime_bin"] <- "7"
+table(time_bins$Lineage_by_genotypeSlingshot)
+```
+
+```{r Helper information for plotting}
+totalVI_proteins_parsed <- totalVI_proteins %>%
+  select("totalVI_proteins" = `0`) %>%
+  mutate("protein_names" = str_split(totalVI_proteins, "_", simplify = TRUE)[,2]) # simplify = TRUE returns a character matrix, then extract second column
+cd4_lin_cells <- time_bins %>%
+  filter(Lineage_by_genotypeSlingshot == "CD4") # 9,663 cells
+cd8_lin_cells <- time_bins %>%
+  filter(Lineage_by_genotypeSlingshot == "CD8") # 9,993 cells
+```
+
+```{r Pseudotime heatmap function}
+# Plot heatmap for both CD4 and CD8 lineage for selected group of genes or proteins
+end_time <- 16.07
+
+plotPseudotimeHeatmap <- function(features, denoised_data, title) {
+  
+  ##############################
+  # Select denoised data to plot
+  ##############################
+
+  # Select genes or proteins for denoised data
+  if (str_detect(colnames(denoised_data)[1], "ADT")) {
+    feature_type = "proteins"
+    heatdata4 <- denoised_data %>%
+      filter(Barcode %in% cd4_lin_cells$Barcode) %>%
+      select(Barcode, (totalVI_proteins_parsed %>% filter(protein_names %in% features) %>% select(totalVI_proteins))[[1]]) %>%
+      left_join(cd4_lin_cells %>% select(Barcode, mean_pseudotime, leiden_totalVI_res0.6, Pseudotime_bin), by = "Barcode")
+    heatdata8 <- denoised_data %>%
+      filter(Barcode %in% cd8_lin_cells$Barcode) %>%
+      select(Barcode, (totalVI_proteins_parsed %>% filter(protein_names %in% features) %>% select(totalVI_proteins))[[1]]) %>%
+      left_join(cd8_lin_cells %>% select(Barcode, mean_pseudotime, leiden_totalVI_res0.6, Pseudotime_bin), by = "Barcode")
+    
+    parsed_selected_proteins <- totalVI_proteins_parsed %>% # cleaner protein names for plotting
+      filter(protein_names %in% features) %>%
+      select(protein_names)
+      
+  } else {
+    feature_type = "genes"
+    heatdata4 <- denoised_data %>%
+      filter(Barcode %in% cd4_lin_cells$Barcode) %>%
+      select(Barcode, all_of(features)) %>%
+      left_join(cd4_lin_cells %>% select(Barcode, mean_pseudotime, leiden_totalVI_res0.6, Pseudotime_bin), by = "Barcode")
+    heatdata8 <- denoised_data %>%
+      filter(Barcode %in% cd8_lin_cells$Barcode) %>%
+      select(Barcode, all_of(features)) %>%
+      left_join(cd8_lin_cells %>% select(Barcode, mean_pseudotime, leiden_totalVI_res0.6, Pseudotime_bin), by = "Barcode")
+  }
+
+  ##############################
+  # Bin expression data by pseudotime and normalize
+  ##############################
+    
+  # Bin data by pseudotime so lineages align
+  bins = 500
+  bindata4 <- heatdata4 %>%
+    mutate(Bins = cut(mean_pseudotime, breaks = seq(0, end_time, length.out = bins), include.lowest = TRUE)) %>% # bin pseudotime
+    select(-c("Barcode", "mean_pseudotime", "leiden_totalVI_res0.6", "Pseudotime_bin"))
+  
+  bindata8 <- heatdata8 %>%
+    mutate(Bins = cut(mean_pseudotime, breaks = seq(0, end_time, length.out = bins), include.lowest = TRUE)) %>% # bin pseudotime
+    select(-c("Barcode", "mean_pseudotime", "leiden_totalVI_res0.6", "Pseudotime_bin"))
+  
+  # Bind CD4 and CD4 so that colors are normalized together
+  n_bins_4 <- dim(bindata4)[1]
+  n_bins_8 <- dim(bindata8)[1]
+  bindata_both_prot <- rbind(bindata4, bindata8) %>% # concatenate bins x genes for CD4, CD8
+    mutate(across(where(is.numeric), scale)) %>% # standard scale for each gene
+    mutate(across(where(is.numeric), ~ Winsorize(.x, probs = c(0.05, 0.95)))) # Winsorize for each gene
+  
+  # Separate into CD4 and CD8
+  norm_CD4 <- bindata_both_prot[1:n_bins_4, ]
+  norm_CD8 <- bindata_both_prot[(n_bins_4+1):(n_bins_4+n_bins_8), ]
+  
+  # Now summarize by bin separately for each lineage
+  norm_CD4 <- norm_CD4 %>% 
+    group_by(Bins) %>%
+    summarize_all(mean)
+  
+  norm_CD8 <- norm_CD8 %>% 
+    group_by(Bins) %>%
+    summarize_all(mean)
+  
+  # Make a matrix and add row/column names
+  CD4_mat <- as.matrix(norm_CD4[, 2:dim(norm_CD4)[2]])
+  row.names(CD4_mat) <- norm_CD4$Bins
+  if (feature_type == "proteins") {   # Rename features if they are proteins
+    colnames(CD4_mat) <- parsed_selected_proteins[[1]]
+  }
+  CD4_mat <- t(CD4_mat)
+  
+  CD8_mat <- as.matrix(norm_CD8[, 2:dim(norm_CD8)[2]])
+  row.names(CD8_mat) <- norm_CD8$Bins
+  if (feature_type == "proteins") {   # Rename features if they are proteins
+    colnames(CD8_mat) <- parsed_selected_proteins[[1]]
+  }
+  CD8_mat <- t(CD8_mat)
+
+  # Matrix of data to plot
+  both_prot_mat <- cbind(CD4_mat, CD8_mat)
+  colnames(both_prot_mat) <- seq(1:dim(both_prot_mat)[2])
+  gap_loc <- dim(CD4_mat)[2] # Where is the gap between CD4/CD8
+  
+  ##############################
+  # Make annotations for heatmap
+  ##############################
+  
+  # Find pseudotime values to use for annotations
+  bin_ranges4 <- tibble(bin_ranges = colnames(CD4_mat)) %>%
+    mutate(Pseudotime = as.numeric(str_replace(str_replace(bin_ranges, "[\\(\\[]", ""), ",.*", ""))) %>% # remove either the first ( or the first [ of the bin range
+    mutate(Time_bin = cut(Pseudotime, breaks = seq(0,16, by = 2), include.lowest = TRUE, labels = str_c(as.character(seq(0, 7)))))
+  bin_ranges4[is.na(bin_ranges4$Time_bin), "Time_bin"] <- "7" #   # assign cells > 16 to the last bin.
+  
+  bin_ranges8 <- tibble(bin_ranges = colnames(CD8_mat)) %>%
+    mutate(Pseudotime = as.numeric(str_replace(str_replace(bin_ranges, "[\\(\\[]", ""), ",.*", ""))) %>%
+    mutate(Time_bin = cut(Pseudotime, breaks = seq(0,16, by = 2), include.lowest = TRUE, labels = str_c(as.character(seq(0, 7)))))
+  bin_ranges8[is.na(bin_ranges8$Time_bin), "Time_bin"] <- "7" 
+  
+  # Annotations df
+  annotation_df4 <- data.frame(Pseudotime = bin_ranges4[, 2])
+  row.names(annotation_df4) <- bin_ranges4$bin_ranges
+  annotation_df8 <- data.frame(Pseudotime = bin_ranges8[, 2])
+  row.names(annotation_df8) <- bin_ranges8$bin_ranges
+  annotation_df_both <- rbind(annotation_df4, annotation_df8) # Pseudotime value
+  annotation_df_both[["Lineage"]] <- c(rep("CD4", dim(annotation_df4)[1]), rep("CD8", dim(annotation_df8)[1])) # Lineage
+  row.names(annotation_df_both) <- seq(1:dim(both_prot_mat)[2])
+  
+  # Annotation colors
+  time_bin_colors <-  brewer.pal(8, "Spectral")
+  names(time_bin_colors) <- as.character(seq(0, 7))
+  ann_colors_both <- list(Pseudotime = colorRampPalette(brewer.pal(11,'Spectral')[-6])(100), # the [-6] removes the lightest yellow color
+                         Lineage = c("CD4" = brewer.pal(3, "Set1")[1],
+                                     "CD8" = brewer.pal(3, "Set1")[2]))
+  # Order of features. Arrange features by peak expression time in the CD4 lineage
+  max_time4 <- apply(CD4_mat, 1, which.max)
+
+  ##############################
+  # Plot heatmap
+  ##############################
+  # # plot to save
+  # pheatmap(both_prot_mat[order(max_time4),],
+  #        cluster_cols = FALSE,
+  #        cluster_rows = FALSE,
+  #        border_color = NA,
+  #        show_colnames = FALSE,
+  #        color = colorRampPalette(viridis(10))(100),
+  #        show_rownames = TRUE,
+  #        annotation_col = annotation_df_both,
+  #        annotation_colors = ann_colors_both,
+  #        cellwidth = .5,
+  #        cellheight = 10, # 10 normal, .1 for de genes, was 5 with bins
+  #        treeheight_row = 0,
+  #        filename = str_c("figures/", title, ".png"),
+  #        gaps_col = c(gap_loc),
+  #        fontsize = 8) 
+  
+  # plot to view
+  pheatmap(both_prot_mat[order(max_time4),], 
+         cluster_cols = FALSE, 
+         cluster_rows = FALSE, 
+         border_color = NA, 
+         show_colnames = FALSE, 
+         color = colorRampPalette(viridis(10))(100), 
+         show_rownames = TRUE, 
+         annotation_col = annotation_df_both,
+         annotation_colors = ann_colors_both,
+         cellwidth = .35, 
+         cellheight = 5, 
+         treeheight_row = 0,
+         gaps_col = c(gap_loc),
+         fontsize = 8)
+}
+```
+
+```{r Plot maturation markers}
+genes <- c("Cd4", "Cd8a", "Cd8b1", "Rag1", "Rag2", "Zbtb7b", "Runx3", "Cxcr4", "Ccr7", "Cd69", "S1pr1", "Klf2", "Gata3")
+maturation_genes <- c(genes, "Trbc1", "Bcl2", "Ccr9", "Ccr4", "Cd24a", "H2-K1", "Sell", "Il7r", "Cd55", "Cd5") # markers from Hogquist et al.
+plotPseudotimeHeatmap(maturation_genes, denoised_genes, "heatmap_Hogquist_markers")
+```
+
+```{r Plot marker proteins}
+maturation_proteins <- c("CD4", "CD8a", "CD8b(Ly-3)", "TCRbchain", "CD24", "CD5", "CD69", "CD127(IL-7Ra)", "CD55(DAF)", "CD62L")
+plotPseudotimeHeatmap(maturation_proteins, denoised_proteins, "heatmap_protein_markers")
+```
+
+## Plot all DE genes over time in heatmap
+
+```{r Load DE features}
+# Select DE features over time and plot as a heatmap
+# Find genes that are DE in any time bin in either lineage
+
+# Load DE results (small time bins)
+de_features4 <- read_csv("/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/DE_thymus/DE_results/DE_CD4_overTime_smallbins.csv")
+de_features8 <- read_csv("/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/DE_thymus/DE_results/DE_CD8_overTime_smallbins.csv")
+
+# DE genes over time in both lineages
+de_genes4 <- de_features4 %>%
+  filter(bayes_factor > 2, lfc_median > 0.2, non_zeros_proportion1 > 0.05, !str_detect(X1, "ADT"))
+de_genes8 <- de_features8 %>%
+  filter(bayes_factor > 2, lfc_median > 0.2, non_zeros_proportion1 > 0.05, !str_detect(X1, "ADT"))
+de_genes_both <- unique(c(de_genes4$X1, de_genes8$X1))
+#length(de_genes_both) # 1113 genes
+```
+
+```{r Make DE labeled heatmap for DE genes}
+denoised_data <- denoised_genes
+features <- de_genes_both
+
+heatdata4 <- denoised_data %>%
+  filter(Barcode %in% cd4_lin_cells$Barcode) %>%
+  select(Barcode, all_of(features)) %>%
+  left_join(cd4_lin_cells %>% select(Barcode, mean_pseudotime, leiden_totalVI_res0.6, Pseudotime_bin), by = "Barcode")
+heatdata8 <- denoised_data %>%
+  filter(Barcode %in% cd8_lin_cells$Barcode) %>%
+  select(Barcode, all_of(features)) %>%
+  left_join(cd8_lin_cells %>% select(Barcode, mean_pseudotime, leiden_totalVI_res0.6, Pseudotime_bin), by = "Barcode")
+
+bins = 500
+bindata4 <- heatdata4 %>%
+  mutate(Bins = cut(mean_pseudotime, breaks = seq(0, end_time, length.out = bins), include.lowest = TRUE)) %>% # bin pseudotime
+  select(-c("Barcode", "mean_pseudotime", "leiden_totalVI_res0.6", "Pseudotime_bin"))
+bindata8 <- heatdata8 %>%
+  mutate(Bins = cut(mean_pseudotime, breaks = seq(0, end_time, length.out = bins), include.lowest = TRUE)) %>% # bin pseudotime
+  select(-c("Barcode", "mean_pseudotime", "leiden_totalVI_res0.6", "Pseudotime_bin"))
+
+# Bind CD4 and CD4 so that colors are normalized together
+n_bins_4 <- dim(bindata4)[1]
+n_bins_8 <- dim(bindata8)[1]
+bindata_both_prot <- rbind(bindata4, bindata8) %>% # concatenate bins x genes for CD4, CD8
+  mutate(across(where(is.numeric), scale)) %>% # standard scale for each gene
+  mutate(across(where(is.numeric), ~ Winsorize(.x, probs = c(0.05, 0.95)))) # Winsorize for each gene
+
+# Separate into CD4 and CD8
+norm_CD4 <- bindata_both_prot[1:n_bins_4, ]
+norm_CD8 <- bindata_both_prot[(n_bins_4+1):(n_bins_4+n_bins_8), ]
+
+# Now summarize by bin separately for each lineage
+norm_CD4 <- norm_CD4 %>% 
+  group_by(Bins) %>%
+  summarize_all(mean)
+norm_CD8 <- norm_CD8 %>% 
+  group_by(Bins) %>%
+  summarize_all(mean)
+
+# Make a matrix and add row/column names
+CD4_mat <- as.matrix(norm_CD4[, 2:dim(norm_CD4)[2]])
+row.names(CD4_mat) <- norm_CD4$Bins
+CD4_mat <- t(CD4_mat)
+
+CD8_mat <- as.matrix(norm_CD8[, 2:dim(norm_CD8)[2]])
+row.names(CD8_mat) <- norm_CD8$Bins
+CD8_mat <- t(CD8_mat)
+
+# Matrix of data to plot
+both_prot_mat <- cbind(CD4_mat, CD8_mat)
+colnames(both_prot_mat) <- seq(1:dim(both_prot_mat)[2])
+gap_loc <- dim(CD4_mat)[2] # Where is the gap between CD4/CD8
+  
+# Find pseudotime values to use for annotations
+bin_ranges4 <- tibble(bin_ranges = colnames(CD4_mat)) %>%
+  mutate(Pseudotime = as.numeric(str_replace(str_replace(bin_ranges, "[\\(\\[]", ""), ",.*", ""))) %>% # remove either the first ( or the first [ of the bin range
+  mutate(Time_bin = cut(Pseudotime, breaks = seq(0,16, by = 2), include.lowest = TRUE, labels = str_c(as.character(seq(0, 7)))))
+bin_ranges4[is.na(bin_ranges4$Time_bin), "Time_bin"] <- "7" # Assign cells > 16 to the last bin 
+
+bin_ranges8 <- tibble(bin_ranges = colnames(CD8_mat)) %>%
+  mutate(Pseudotime = as.numeric(str_replace(str_replace(bin_ranges, "[\\(\\[]", ""), ",.*", ""))) %>% # remove either the first ( or the first [ of the bin range
+  mutate(Time_bin = cut(Pseudotime, breaks = seq(0,16, by = 2), include.lowest = TRUE, labels = str_c(as.character(seq(0, 7)))))
+bin_ranges8[is.na(bin_ranges8$Time_bin), "Time_bin"] <- "7" 
+
+# Annotations df
+annotation_df4 <- data.frame(Pseudotime = bin_ranges4[, 2])
+row.names(annotation_df4) <- bin_ranges4$bin_ranges
+annotation_df8 <- data.frame(Pseudotime = bin_ranges8[, 2])
+row.names(annotation_df8) <- bin_ranges8$bin_ranges
+annotation_df_both <- rbind(annotation_df4, annotation_df8) # Pseudotime value
+annotation_df_both[["Lineage"]] <- c(rep("CD4", dim(annotation_df4)[1]), rep("CD8", dim(annotation_df8)[1])) # Lineage
+row.names(annotation_df_both) <- seq(1:dim(both_prot_mat)[2])
+
+# Annotation colors
+time_bin_colors <-  brewer.pal(8, "Spectral")
+names(time_bin_colors) <- as.character(seq(0, 7))
+ann_colors_both <- list(
+                       #Time_bin = time_bin_colors,
+                       Pseudotime = colorRampPalette(brewer.pal(11,'Spectral')[-6])(100),
+                       Lineage = c("CD4" = brewer.pal(3, "Set1")[1],
+                                   "CD8" = brewer.pal(3, "Set1")[2]))
+# Order of features
+max_time4 <- apply(CD4_mat, 1, which.max)
+
+# Row names (genes)
+gene_names_rows <- tibble(Gene = row.names(both_prot_mat[order(max_time4),])) # Get current row names for all genes
+```
+
+```{r Select DE genes to label in the heatmap}
+# Label the top DE genes over time that are shared across lineages
+d8_top_temporal <- de_features8 %>%
+  select(Gene = X1, everything()) %>%
+  filter(lfc_median > 0.2) %>%
+  filter(bayes_factor > 2) %>%
+  filter(non_zeros_proportion1 > 0.2) %>%
+  filter(!(str_detect(Gene, "ADT_"))) %>%
+  group_by(clusters) %>%
+  arrange(desc(lfc_median)) %>%
+  slice_head(n = 8) %>%
+  ungroup() %>%
+  select(Gene) %>%
+  pull() %>%
+  unique()
+
+d4_top_temporal <- de_features4 %>%
+  select(Gene = X1, everything()) %>%
+  filter(lfc_median > 0.2) %>%
+  filter(bayes_factor > 2) %>%
+  filter(non_zeros_proportion1 > 0.2) %>%
+  filter(!(str_detect(Gene, "ADT_"))) %>%
+  group_by(clusters) %>%
+  arrange(desc(lfc_median)) %>%
+  slice_head(n = 8) %>%
+  ungroup() %>%
+  select(Gene) %>%
+  pull() %>%
+  unique()
+
+toptemporaldeboth <- intersect(d4_top_temporal, d8_top_temporal)
+
+# Generate row names, add as "labels_row" to plot in pheatmap instead of row names
+gene_names_rows_select <- gene_names_rows %>%
+  mutate(labels_individual = case_when(Gene %in% toptemporaldeboth ~ Gene,
+                                       TRUE ~ "")) %>%
+  mutate(row_number = row_number()) %>%
+  mutate(group_number = cut_interval(row_number, 15)) # make 15 groups genes of equal size
+
+# Make labels from groups
+group_labels <- gene_names_rows_select %>%
+  filter(labels_individual != "") %>%
+  group_by(group_number) %>%
+  summarize(labels_group = str_c(labels_individual, collapse = ", ")) %>%
+  mutate(label_position = str_replace(labels_group, ",.*", ""))
+group_labels
+
+# Make vector of labels
+group_labels_vec <- group_labels$labels_group
+names(group_labels_vec) <- group_labels$label_position
+
+# Make labels
+gene_names_rows_all <- gene_names_rows_select %>%
+    mutate(labels_grouped = case_when(Gene %in% group_labels$label_position ~ Gene,
+                                       TRUE ~ "")) %>%
+  mutate(labels_grouped_multi = str_replace_all(labels_grouped, group_labels_vec))
+```
+
+```{r Plot the multi-label heatmap}
+# # Plot to save
+# pheatmap(both_prot_mat[order(max_time4),],
+#        cluster_cols = FALSE,
+#        cluster_rows = FALSE,
+#        border_color = NA,
+#        show_colnames = FALSE,
+#        color = colorRampPalette(viridis(10))(100),
+#        show_rownames = TRUE,
+#        labels_row = gene_names_rows_all %>% select(labels_grouped_multi) %>% pull(),
+#        annotation_col = annotation_df_both,
+#        annotation_colors = ann_colors_both,
+#        cellwidth = .5,
+#        cellheight = .15, 
+#        treeheight_row = 0,
+#        filename = str_c("figures/", "heatmap_de_genes_labels", ".png"),
+#        gaps_col = c(gap_loc),
+#        fontsize = 8,
+#       fontsize_row = 6.5)
+
+# Plot to view
+pheatmap(both_prot_mat[order(max_time4),], 
+       cluster_cols = FALSE, 
+       cluster_rows = FALSE, 
+       border_color = NA, 
+       show_colnames = FALSE, 
+       color = colorRampPalette(viridis(10))(100), 
+       show_rownames = TRUE,
+       labels_row = gene_names_rows_all %>% select(labels_grouped_multi) %>% pull(),
+       annotation_col = annotation_df_both,
+       annotation_colors = ann_colors_both,
+       cellwidth = .35, 
+       cellheight = .15, 
+       treeheight_row = 0,
+       gaps_col = c(gap_loc),
+       fontsize = 8,
+       fontsize_row = 7)
+```
+
+# Bin pseudotime for visualization and DE
+
+```{r Make pseudotime bins}
+# pseudotime_data contains all cells used in Slingshot
+time_bins <- pseudotime_data %>%
+  mutate(Pseudotime_bin = cut(mean_pseudotime, breaks = seq(0,16, by = 2), include.lowest = TRUE,
+                              labels = str_c("Time", as.character(seq(0, 14, by = 2)))))
+
+# Assign cells > 16 to the last bin
+time_bins[is.na(time_bins$Pseudotime_bin), "Pseudotime_bin"] <- "Time14" # This is exactly 20 cells
+# Note that these bins are used for visualization. DE testing uses smaller time bins
+```
+
+```{r Save bins for totalVI DE}
+# Metadata: for all cells: Barcode, Pseudotime, Pseudotime_bin, Lineage, Genotype
+totalVI_bins <- totalVI_meta %>%
+  select(c(Barcode, Sample, Genotype, Experiment, Location, Mouse)) %>%
+  left_join(time_bins %>% select(c("Barcode", "mean_pseudotime", "Lineage_by_genotype", "Lineage_by_genotypeSlingshot", "Pseudotime_bin")), by = "Barcode") %>%
+  replace_na(list(Lineage_by_genotype = "unassigned", Lineage_by_genotypeSlingshot = "unassigned")) # replace NA values in lineages by "unassigned"
+totalVI_bins
+
+write_csv(totalVI_bins, "pseudotime_slingshot_binned_20200913.csv")
+totalVI_bins <- read_csv("pseudotime_slingshot_binned_20200913.csv")
+```
+
+# Run Slingshot on full latent space
+
+```{r Run slingshot on high dimensions}
+# Filter latent space to run on just selected cells
+totalVI_latent_filt <- totalvi_latent[totalVI_clusters_filt$Barcode, ]
+totalVI_umap_filt <- totalvi_umap[totalVI_clusters_filt$Barcode, ]
+
+lin <- getLineages(
+  totalVI_latent_filt, 
+  totalVI_clusters_filt$slingshot_clusters,
+  start.clus = "1",
+  end.clus = c("0", "3")
+  )
+lin 
+```
+
+```{r Run Slingshot get curves on high dimensions}
+crv <- getCurves(lin, approx_points = 200)
+```
+
+```{r Plot results for high dimension Slingshot}
+# Plot pseudotime ordering of Slingshot in high dimensions onto 2D UMAP plot
+pseudotime <- as_tibble(slingPseudotime(crv)) %>%
+  mutate(difference = abs(curve1 - curve2)) 
+pseudotime <- pseudotime %>%
+  mutate(mean_pseudotime = rowMeans(select(pseudotime, c(curve1, curve2)), na.rm = TRUE)) %>%
+  mutate(UMAP1 = totalVI_umap_filt[,1]) %>%
+  mutate(UMAP2 = totalVI_umap_filt[,2])
+
+ggplot() +
+  theme_classic() +
+  geom_point(pseudotime, mapping = aes(x = UMAP1, y = UMAP2, color = mean_pseudotime), stroke  = 0, size = .8) +
+  scale_color_gradientn(colors = colorRampPalette(brewer.pal(11,'Spectral')[-6])(100)) + 
+  coord_fixed(ratio = 1) +
+  labs(color = "Pseudotime") +
+  labs(title = "Slingshot (full latent space)")
+```
+
+```{r Plot each lineage for high dimension Slingshot}
+ggplot() +
+  geom_point(pseudotime, mapping = aes(x = UMAP1, y = UMAP2), color = "grey75", stroke  = 0, size = .8) +
+  theme_classic() +
+  geom_point(pseudotime, mapping = aes(x = UMAP1, y = UMAP2, color = curve1), stroke  = 0, size = .8) +
+  scale_color_gradientn(colors = brewer.spectral(100)) +
+  coord_fixed(ratio = 1) +
+  labs(color = "Pseudotime")
+
+ggplot() +
+  geom_point(pseudotime, mapping = aes(x = UMAP1, y = UMAP2), color = "grey75", stroke  = 0, size = .8) + 
+  theme_classic() +
+  geom_point(pseudotime, mapping = aes(x = UMAP1, y = UMAP2, color = curve2), stroke  = 0, size = .8) +
+  scale_color_gradientn(colors = brewer.spectral(100)) +
+  coord_fixed(ratio = 1) +
+  labs(color = "Pseudotime")
+```
+
+# Compare pseudotime orderings (2D vs full latent space)
+
+```{r Plot pseudotime orderings from 2D and 20D}
+# 2D
+pseudotime_data <- read_csv("pseudotime_slingshot_2020913.csv", col_types = cols(Lineage_by_genotype = col_character(), 
+                                                                                  Lineage_by_genotypeSlingshot = col_character()))
+
+# 20D (full latent space)
+pseudotime_all <- pseudotime %>%
+  mutate(Barcode = totalVI_clusters_filt$Barcode) %>%
+  left_join(pseudotime_data, by = "Barcode", suffix = c("_20D", "_2D"))
+
+cor(pseudotime_all$mean_pseudotime_2D, pseudotime_all$mean_pseudotime_20D, method = "spearman") #  0.9747765
+cor(pseudotime_all$mean_pseudotime_2D, pseudotime_all$mean_pseudotime_20D, method = "pearson") # 0.9778185
+
+ggplot(pseudotime_all, aes(x = mean_pseudotime_2D, y = mean_pseudotime_20D, color = mean_pseudotime_2D)) +
+  geom_point(stroke = 0, size = 0.5) +
+  annotate("text", label = "Pearson R: 0.978", x = 3.5, y = 0.8) +
+  scale_color_gradientn(colors = colorRampPalette(brewer.pal(11,'Spectral')[-6])(100)) +
+  labs(x = "Pseudotime (2D)", y = "Pseudotime (20D)", color = "Pseudotime (2D)") +
+  theme_classic() +
+  theme(legend.position = "bottom", aspect.ratio = 1/1)
+ggsave("figures/pseudotime_2d_20d_comparison.png", bg = "transparent", height = 4.5, width = 4, dpi = 1000)
+```
