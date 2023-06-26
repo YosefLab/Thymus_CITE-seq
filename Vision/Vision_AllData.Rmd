@@ -1,0 +1,160 @@
+---
+title: "Run Vision on totalVI outputs for full thymus CITE-seq data set"
+output: html_notebook
+---
+
+Zoë Steier
+
+Run Vision on totalVI outputs for full thymus CITE-seq data set.
+
+# Load required packages
+```{r Install and load required packages}
+# Install packages
+# library(devtools)
+# install_version("Matrix", version = "1.5.1")
+# install_github("YosefLab/VISION@v2.1.0")
+
+# Load packages
+library(VISION)
+library(tidyverse)
+
+sessionInfo()
+```
+
+# Load data
+## Load totalVI data and metadata
+
+```{r Load data as csvs saved from anndata}
+totalvi_path <- "/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/totalVI_thymus/thymus111_allbatches_stable/totalVI_results/"
+
+latent <- read_csv(gzfile(str_c(totalvi_path, "latent.csv.gz")))
+umap_totalVI <- read_csv(gzfile(str_c(totalvi_path, "umap.csv.gz")))
+denoised_proteins <- read_csv(gzfile(str_c(totalvi_path, "denoised_proteins.csv.gz")))
+raw_proteins <- read_csv(gzfile(str_c(totalvi_path, "raw_proteins.csv.gz")))
+totalVI_genes <- read_csv(gzfile(str_c(totalvi_path, "totalVI_genes.csv.gz")))
+totalVI_proteins <- read_csv(gzfile(str_c(totalvi_path, "totalVI_proteins.csv.gz")))
+raw_genes <- read_csv(gzfile(str_c(totalvi_path, "raw_genes.csv.gz")))
+obs <- read_csv(gzfile(str_c(totalvi_path, "obs.csv.gz")))
+
+annotations_path <- "/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/Annotation_thymus/"
+annotations <- read_csv(gzfile(str_c(annotations_path, "annotations.csv.gz")))
+```
+
+```{r Load sample metadata}
+meta_csv <- read_csv("/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/metadata/Metadata_SeqStats_totalSeq_experiments.csv")
+meta_thymus <- meta_csv %>%
+  filter(Tissue == "thymus") %>%
+  filter(TotalSeq_panel == "ADT111")# %>% # 19 batches in total
+meta_thymus <- meta_thymus %>%
+  mutate(Batch = seq(1, dim(meta_thymus)[1]) - 1) # rename batches starting at 0
+
+meta_thymus
+```
+
+## Process data for Vision
+
+```{r Process totalVI data}
+# totalVI umap
+totalvi_umap <- as.data.frame(umap_totalVI[, -1]) # Remove first column of dataframes - this is an index column coming from python
+colnames(totalvi_umap) <- c("UMAP1", "UMAP2")
+row.names(totalvi_umap) <- obs$X1
+
+# totalVI latent space
+totalvi_latent <- as.matrix(latent[, -1])
+row.names(totalvi_latent) <- obs$X1
+
+# totalVI denoised proteins. Use in proteinData in Vision that can be viewed in biaxial plots like FACS.
+denoised_proteins_df <- log1p(as.data.frame(denoised_proteins[-1])) # take log of denoised protein data for in silico FACS
+row.names(denoised_proteins_df) <- obs$X1
+colnames(denoised_proteins_df) <- totalVI_proteins[, 2][[1]]
+
+# Raw proteins
+raw_proteins_df <- log1p(as.data.frame(raw_proteins[, -1])) # Take log of protein data
+row.names(raw_proteins_df) <- obs$X1
+
+# Rename raw columns to start with raw
+totalVI_proteins <- totalVI_proteins %>%
+  mutate(raw_name = str_c("raw_", totalVI_proteins$`0`))
+colnames(raw_proteins_df) <- totalVI_proteins$raw_name # set raw protein names
+
+# Add raw proteins to the denoised proteins so they can both be visualized
+all_proteins <- cbind(denoised_proteins_df, raw_proteins_df)
+
+# Raw gene expression data 
+raw_genes_df <- as.data.frame(raw_genes[, -1])
+row.names(raw_genes_df) <- obs$X1
+colnames(raw_genes_df) <- totalVI_genes[, 2][[1]]
+
+dim(all_proteins) # cells x proteins
+```
+
+```{r Make metadata for Vision}
+# totalVI metadata and sample metadata
+totalVI_meta <- obs %>%
+  select(Batch = 'batch_indices', UMIs_RNA = "n_counts", UMIs_protein = "n_protein_counts",
+          'n_genes', 'n_proteins', 'percent_mito', contains("leiden_totalVI_")) %>%
+  mutate_at(vars(contains("leiden_totalVI_")), as_factor) %>% # Convert cluster labels to factors
+  left_join(meta_thymus %>% select(Sample, Genotype, Experiment, Replicate, Location, Batch), by = "Batch") %>% # Join with experimental metadata
+  mutate(Mouse = str_c(Genotype, "_", Replicate)) %>% # Add mouse information
+  mutate_at(c("Sample", "Batch", "Mouse", "Experiment", "Genotype", "Location"), as_factor) %>% # Set as factors to preserve the order of levels
+  select(-c("Replicate", "Batch", "Sample", "Experiment"))
+
+# Add lineage information to metadata
+totalVI_meta <- totalVI_meta %>%
+  mutate(Annotation = as.factor(annotations$labels)) %>%
+  mutate(Lineage_by_genotype = as.factor(case_when(Genotype == "B6" ~ "WT", # Assign each cell to a lineage
+                             Genotype %in% c("AND", "OT2", "B2M") ~ "CD4",
+                             Genotype %in% c("F5", "OT1", "MHC2") ~ "CD8"))) %>%
+  select("Lineage_by_genotype", "Genotype", "Mouse", "Location", "Annotation", everything())
+
+# Make metadata dataframe
+totalVI_metadata <- as.data.frame(totalVI_meta)
+row.names(totalVI_metadata) <- obs$X1 # Add the cell barcodes as row names
+
+totalVI_metadata[1:5, ]
+```
+
+# Run Vision
+
+```{r Get signatures}
+signatures <- c(
+  "/data/yosef2/users/david.detomaso/Signatures/MSIGDB/H_Hallmark.gmt",
+  "/data/yosef2/users/david.detomaso/Signatures/Yoseflab/netPath.gmt", 
+  "/data/yosef2/users/david.detomaso/Signatures/Yoseflab/signatures_NY_private.gmt"
+)
+```
+
+```{r Make RNA matrix}
+# Make RNA matrix
+n.umi = median(colSums(t(raw_genes_df)))
+expr = apply(t(raw_genes_df), 2, function(x) (x * n.umi) / (sum(x) + 1))
+expr[1:5, 1:5]
+
+# Set variable genes for Vision
+projection_genes <- row.names(expr)
+```
+
+```{r Run Vision}
+# Create Vision object
+vis <- Vision(expr[,],
+              signatures = signatures,
+              meta = totalVI_metadata, # 
+              projection_genes = projection_genes,
+              proteinData = all_proteins[,], 
+              projection_methods = c("UMAP"),
+              latentSpace = totalvi_latent[,],
+              name = "Thymus CITE-seq all data") 
+
+vis = addProjection(vis, name = "UMAP_totalVI", coordinates = totalvi_umap[,1:2]) # Add totalVI UMAP
+
+saveRDS(vis, "/data/yosef2/users/zsteier/TotalSeq/20190814_BioLegend_ZRS08/analysis/Vision_thymus/NI_alldata_annotated/vis_object_unanalyzed.rds")
+
+# Run in script on multiple cores.
+# options(mc.cores = 10) # set the number of cores
+# vis <- analyze(vis)
+# saveRDS(vis, 'vision_object_analyzed.rds')  # save results
+
+# View results
+# vis <- readRDS('vision_object_analyzed.rds')
+# vis <- viewResults(vis, host='0.0.0.0', port=9002, browser = FALSE)
+```
