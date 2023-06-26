@@ -9,6 +9,10 @@ This repository contains code for the analysis performed in this manuscript.
 
 The CITE-seq data generated in this manuscript are accessible through GEO: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE186078.
 
+The thymus CITE-seq data set can be explored interactively with Vision:
+  - Positive selection subset: http://s133.cs.berkeley.edu:9001/Results.html
+  - Full data set: http://s133.cs.berkeley.edu:9002/Results.html
+
 ## Analysis notebooks
 
 * __totalVI_AllData/__ 
@@ -32,4 +36,7 @@ The CITE-seq data generated in this manuscript are accessible through GEO: https
 
 * __Multidimensional_Flow/__ 
   * ```Multidimensional_Flow.ipynb``` Multidimensional flow analysis
-
+ 
+* __Vision/__ 
+  * ```Vision_AllData.Rmd``` Run Vision to generate session for interactive exploration of the full CITE-seq data set
+  * ```Vision_PositiveSelection.Rmd``` Run Vision to generate session for interactive exploration of the positive selection subset of the data
