@@ -41,6 +41,6 @@ This repository contains code for the analysis performed in this manuscript.
 
 * The anndata objects and pseudotime metadata are accessible through zenodo: https://zenodo.org/doi/10.5281/zenodo.8102049
 
-* The thymus CITE-seq data set can be explored interactively with Vision:
-  - Positive selection subset: http://s133.cs.berkeley.edu:9001/Results.html
-  - Full data set: http://s133.cs.berkeley.edu:9002/Results.html
+* The thymus CITE-seq data set can be explored interactively with CELLxGENE: https://cellxgene.cziscience.com/collections/7e216a15-82df-46ee-b454-d0261d99e5f5
+  - Positive selection subset: https://cellxgene.cziscience.com/e/8d819c30-9759-41b4-9871-8acddfadb0bc.cxg/
+  - Full data set: https://cellxgene.cziscience.com/e/c14c54f8-85d8-45db-9de7-6ab572cc748a.cxg/
